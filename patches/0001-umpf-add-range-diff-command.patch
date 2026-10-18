@@ -1,0 +1,199 @@
+From ba8dff2c02d09b3c9e7d521ddaf23c46d362ed7c Mon Sep 17 00:00:00 2001
+From: Ahmad Fatoum <ahmad@a3f.at>
+Date: Sun, 18 Oct 2026 22:44:20 +0200
+Subject: [PATCH] umpf: add range-diff command
+
+After rebasing an umpf onto a new base, a plain git diff between the old
+and the new utag also contains all upstream changes. git range-diff shows
+how the patch stack itself changed, but needs the base and the flat tip
+of both umpfs, which umpf already knows.
+
+Add "umpf range-diff <old> [<new>]", which takes utags or qualified
+useries files (e.g. from format-patch), and passes options after '--'
+on to git range-diff.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ bash_completion         |  2 +-
+ doc/getting-started.rst | 20 +++++++++++++++++
+ tests/meson.build       |  3 ++-
+ tests/umpf-range-diff   | 33 ++++++++++++++++++++++++++++
+ umpf                    | 48 ++++++++++++++++++++++++++++++++++++++++-
+ 5 files changed, 103 insertions(+), 3 deletions(-)
+ create mode 100755 tests/umpf-range-diff
+
+diff --git a/bash_completion b/bash_completion
+index efda5081853e..962a37a318ff 100644
+--- a/bash_completion
++++ b/bash_completion
+@@ -38,7 +38,7 @@ _umpf_completion()
+ 	"")
+ 		COMPREPLY=( $( compgen -W "${completion_cmds[*]} help" -- $cur ) )
+ 		;;
+-	diff|show|tag|tig|build|push|pull)
++	diff|show|tag|tig|build|push|pull|range-diff)
+ 		local -a refs
+ 		refs=( $( compgen -W "$( git for-each-ref --format='%(refname:short)' refs/tags refs/heads refs/remotes)" -- $cur ) )
+ 		if [ ${#refs[@]} -eq 0 ]; then
+diff --git a/doc/getting-started.rst b/doc/getting-started.rst
+index 35bd388fa9b8..35ef0d1d2b66 100644
+--- a/doc/getting-started.rst
++++ b/doc/getting-started.rst
+@@ -447,6 +447,26 @@ Or tell umpf to rebase onto a new *umpf-base* when creating a fresh *utag*::
+     # umpf-topic-range: 8bae5bbec8cb4599c141405e9755b7c0e42e064f..19cdc2b857e662a38c712b41ce610000a5ddc6ae
+     # umpf-end
+ 
++Comparing *utags*
++-----------------
++
++After rebasing onto a new *umpf-base*, a plain ``git diff`` between the old
++and the new *utag* contains all upstream changes as well. To only review
++how the patch stack itself changed, use ``umpf range-diff``::
++
++   ~/linux $  umpf range-diff 5.0/special-customer-release/20190311-1 5.0/special-customer-release/20230309-2
++
++It looks up the *umpf-base* and the linear patch stack of both *utags* and
++runs ``git range-diff`` on them. Instead of a *utag*, a qualified *useries*
++file can be given, e.g. the ``series`` file written by ``umpf format-patch``.
++If the second *umpf* is omitted, ``HEAD`` is used, which is convenient right
++after ``umpf tag``.
++
++Options after ``--`` are passed to ``git range-diff``, e.g. to show only the
++list of changed, added and dropped patches::
++
++   ~/linux $  umpf range-diff 5.0/special-customer-release/20190311-1 -- --no-patch
++
+ Synchronizing umpf topic branch
+ -------------------------------
+ 
+diff --git a/tests/meson.build b/tests/meson.build
+index e9d802fe2d57..f1a29e8c2b61 100644
+--- a/tests/meson.build
++++ b/tests/meson.build
+@@ -23,7 +23,8 @@ tests = [
+   'umpf-format-patch',
+   'umpf-format-patch-bb',
+   'umpf-show',
+-  'umpf-versions'
++  'umpf-versions',
++  'umpf-range-diff'
+ ]
+ foreach test_name : tests
+   test(test_name, run_test, args: test_name, env: test_env)
+diff --git a/tests/umpf-range-diff b/tests/umpf-range-diff
+new file mode 100755
+index 000000000000..3c4b67694a9a
+--- /dev/null
++++ b/tests/umpf-range-diff
+@@ -0,0 +1,33 @@
++#!/bin/sh
++#
++# Test comparing the patch stacks of two umpfs with "umpf range-diff".
++#
++
++# two utags with the same base
++umpf range-diff name/20221209-1 name/20240314-2 -- --no-color > range-diff.out
++git range-diff --no-color base..name/20221209-1^ base..name/20240314-2^ > range-diff.ref
++diff -u range-diff.ref range-diff.out
++
++# a qualified useries works as well
++umpf format-patch name/20240314-2 --patchdir=patches
++umpf range-diff patches/series name/20221209-1 -- --no-color > range-diff.out
++git range-diff --no-color base..name/20240314-2^ base..name/20221209-1^ > range-diff.ref
++diff -u range-diff.ref range-diff.out
++
++# rebase onto a new base, compare against HEAD (the new utag)
++git checkout -q base
++echo "new base" > newbase
++git add newbase
++git commit -q -m "new base"
++git tag -a -m "new base" newbase
++umpf tag --identical --base=newbase --version=3 name/20240314-2
++newtag="$(git describe --exact-match HEAD)"
++umpf range-diff name/20240314-2 -- --no-color --no-patch > range-diff.out
++git range-diff --no-color --no-patch base..name/20240314-2^ "newbase..${newtag}^" > range-diff.ref
++diff -u range-diff.ref range-diff.out
++test "$(wc -l < range-diff.out)" -eq 2
++
++# unqualified useries files have no patch stack
++if umpf range-diff series name/20240314-2; then
++	exit 1
++fi
+diff --git a/umpf b/umpf
+index fddb73cad02e..5d1fb6e4a528 100755
+--- a/umpf
++++ b/umpf
+@@ -216,6 +216,9 @@ usage() {
+ 	  show [<umpf>|<commit-ish>] show an useries file from an umpf
+ 	  tig [<umpf>]               browse an umpf interactively, showing state of
+ 	                             local, remote and remote-tracking topic branches
++	  range-diff <old> [<new>]   compare the patch stacks of two utags or
++	                             qualified useries files with git range-diff.
++	                             Options after '--' are passed to git.
+ 
+ 	  tag [<umpf>|<commit-ish>]  generate a utag from a useries or umerge
+ 	                             or commits stacked on top of an umpf
+@@ -811,7 +814,7 @@ verify_topic() {
+ 	if ${IDENTICAL} && ! grep -q hashinfo "${STATE}/check"; then
+ 		abort "Cannot run identical '$(<${STATE}/command)' without 'hashinfo' (${line})!"
+ 	fi
+-	if [ "$(<${STATE}/command)" = "format_patch" ] && ! grep -q topic-range "${STATE}/check"; then
++	if [[ "$(<${STATE}/command)" =~ ^(format_patch|range_diff)$ ]] && ! grep -q topic-range "${STATE}/check"; then
+ 		abort "Cannot run '$(<${STATE}/command)' without a 'topic-range' for each 'topic'!" \
+ 			"Maybe you need to 'tag' first?"
+ 	fi
+@@ -2070,6 +2073,49 @@ do_continue() {
+ 	esac
+ }
+ 
++### namespace: range_diff ###
++
++range_diff_base() {
++	echo "${baserev}" > "${STATE}/range-base"
++}
++
++range_diff_topic_range() {
++	echo "${content##*..}" > "${STATE}/range-tip"
++}
++
++### command: range-diff ###
++
++# set ${range} to the linear patch stack of an umpf: <base>..<last topic-range>
++range_diff_range() {
++	prepare_persistent range_diff "${1}"
++	parse_series range_diff "${STATE}/series"
++	if [ ! -e "${STATE}/range-tip" ]; then
++		abort "'${1}' contains no patches"
++	fi
++	range="$(<"${STATE}/range-base")..$(<"${STATE}/range-tip")"
++	cleanup
++}
++
++do_range_diff() {
++	local range old new
++	if [[ $# -lt 1 || "${1}" == -* ]]; then
++		info "usage: umpf range-diff <old> [<new>] [-- <git range-diff options>]"
++		exit 1
++	fi
++	range_diff_range "${1}"
++	old="${range}"
++	shift
++	if [[ $# -gt 0 && "${1}" != -* ]]; then
++		range_diff_range "${1}"
++		shift
++	else
++		range_diff_range HEAD
++	fi
++	new="${range}"
++
++	${GIT} range-diff "${@}" "${old}" "${new}"
++}
++
+ ### command: abort ###
+ 
+ do_abort() {
+
+base-commit: 0d713dcc31cf5ea0c385bb7b9ac4c45947d56729
+-- 
+2.47.3
+

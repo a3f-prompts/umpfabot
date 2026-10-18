@@ -1,0 +1,1724 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+#
+# umpfabot - keep umpfs in BSP repositories up to date with pull requests
+#
+# Commands:
+#   stable-update  rebase the umpf of a BSP onto the newest upstream stable
+#                  release and open a pull request for it
+#
+# See README.rst next to this script for the configuration reference.
+
+from __future__ import annotations
+
+import argparse
+import dataclasses
+import difflib
+import functools
+import glob
+import hashlib
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+import textwrap
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+try:
+    import yaml
+except ImportError:
+    sys.exit("umpfabot: PyYAML is required (e.g. apt install python3-yaml)")
+
+FEATURE = "stable-update"
+DEFAULT_CONFIG = ".github/umpfabot.yml"
+DEFAULT_AUTHOR = "umpfabot <umpfabot@users.noreply.github.com>"
+DEFAULT_UMPF_REPOSITORY = "https://github.com/pengutronix/umpf.git"
+METADATA_RE = re.compile(r"<!-- umpfabot-metadata: (\{.*?\}) -->")
+# GitHub limits pull request bodies to 65536 characters
+MAX_SECTION = 20000
+
+VERBOSE = False
+SUMMARY: list[str] = []
+
+
+class Error(Exception):
+    pass
+
+
+def github_actions() -> bool:
+    return os.environ.get("GITHUB_ACTIONS") == "true"
+
+
+def info(msg: str) -> None:
+    print(f"umpfabot: {msg}", file=sys.stderr, flush=True)
+
+
+def notice(msg: str) -> None:
+    """an action taken or skipped, also added to the job summary"""
+    SUMMARY.append(msg)
+    if github_actions():
+        print(f"::notice::{msg}", flush=True)
+    else:
+        info(msg)
+
+
+def warning(msg: str) -> None:
+    SUMMARY.append(f"warning: {msg}")
+    if github_actions():
+        print(f"::warning::{msg}", flush=True)
+    else:
+        info(f"warning: {msg}")
+
+
+def run(args: list[str], cwd: str | None = None, env: dict | None = None,
+        check: bool = True, input: str | None = None) -> subprocess.CompletedProcess:
+    if VERBOSE:
+        info(f"+ {shlex.join(args)}" + (f"  (in {cwd})" if cwd else ""))
+    proc = subprocess.run(args, cwd=cwd, env=env, input=input, text=True,
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if VERBOSE and proc.stderr:
+        sys.stderr.write(proc.stderr)
+    if check and proc.returncode != 0:
+        raise Error(f"'{shlex.join(args)}' failed with exit code {proc.returncode}:\n"
+                    f"{proc.stdout}{proc.stderr}".rstrip())
+    return proc
+
+
+class Git:
+    def __init__(self, path: str, env: dict | None = None):
+        self.path = path
+        self.env = env
+
+    def __call__(self, *args: str, check: bool = True, input: str | None = None) -> str:
+        return run(["git", *args], cwd=self.path, env=self.env, check=check,
+                   input=input).stdout.rstrip("\n")
+
+    def ok(self, *args: str) -> bool:
+        return run(["git", *args], cwd=self.path, env=self.env, check=False).returncode == 0
+
+    def rev(self, rev: str) -> str | None:
+        out = self("rev-parse", "--verify", "-q", rev + "^{commit}", check=False)
+        return out or None
+
+    def show(self, commit: str, path: str) -> str | None:
+        proc = run(["git", "show", f"{commit}:{path}"], cwd=self.path, env=self.env, check=False)
+        return proc.stdout if proc.returncode == 0 else None
+
+    def remote_refs(self, remote: str, *patterns: str) -> dict[str, str]:
+        refs = {}
+        for line in self("ls-remote", "--refs", remote, *patterns).splitlines():
+            sha, ref = line.split("\t", 1)
+            refs[ref] = sha
+        return refs
+
+
+def git_env(token: str | None, server_url: str) -> dict:
+    """environment for git: never prompt and authenticate with token, if any
+
+    The token is provided through a credential helper, so it is only used
+    if the server asks for credentials, e.g. not if actions/checkout already
+    configured an authorization header for the repository."""
+    env = dict(os.environ, GIT_TERMINAL_PROMPT="0")
+    if token:
+        env["UMPFABOT_GIT_TOKEN"] = token
+        count = int(env.get("GIT_CONFIG_COUNT", "0"))
+        helper = ('!f() { test "$1" = get || return 0; echo username=x-access-token; '
+                  'echo "password=${UMPFABOT_GIT_TOKEN}"; }; f')
+        # an empty helper resets the list of helpers configured elsewhere
+        for i, value in enumerate(("", helper)):
+            env[f"GIT_CONFIG_KEY_{count + i}"] = f"credential.{server_url}.helper"
+            env[f"GIT_CONFIG_VALUE_{count + i}"] = value
+        env["GIT_CONFIG_COUNT"] = str(count + 2)
+    return env
+
+
+### versions ###
+
+def version_key(version: str) -> tuple:
+    """sort key compatible with 'sort -V' for the usual release versions"""
+    return tuple((0, int(p), "") if p.isdigit() else (1, 0, p)
+                 for p in re.findall(r"\d+|[^\d.]+", version))
+
+
+def format_url(template: str, tag: str, version: str, entry_id: str) -> str:
+    parts = version.split(".")
+    return template.format(tag=tag, version=version, id=entry_id,
+                           major=parts[0], minor=parts[1] if len(parts) > 1 else "",
+                           series=".".join(parts[:2]))
+
+
+### configuration ###
+
+def _get(d: dict, key: str, kind, default=None, required=False, where=""):
+    if key not in d or d[key] is None:
+        if required:
+            raise Error(f"{where}: '{key}' is required")
+        return default
+    value = d[key]
+    if kind is not None and not isinstance(value, kind):
+        raise Error(f"{where}: '{key}' has invalid type {type(value).__name__}")
+    return value
+
+
+@dataclasses.dataclass
+class Sdk:
+    installer: str | None
+    sha256: str | None
+    path: str | None
+    environment_setup: str
+    env: dict[str, str]
+
+
+@dataclasses.dataclass
+class Entry:
+    """one stable-update entry of the configuration"""
+    id: str
+    series: str
+    recipe: str | None
+    repository: str
+    compare_url: str | None
+    upstream: str | None
+    tag_prefix: str
+    stable_version_parts: int
+    stable_release_regex: str | None
+    changelog_url: str | None
+    tarball_url: str | None
+    checksum_name: str | None
+    defconfig: str | None
+    savedefconfig: bool
+    make_args: list[str]
+    sdk: Sdk | None
+    tag_version: int
+    target_branch: str | None
+    pending: str
+    open_pull_requests_limit: int
+    labels: list[str]
+    reviewers: list[str]
+    assignees: list[str]
+    commit_prefix: str
+    signoff: bool
+
+    @property
+    def patch_dir(self) -> str:
+        return os.path.dirname(self.series)
+
+    @property
+    def branch_prefix(self) -> str:
+        return f"umpfabot/{FEATURE}/{self.id}/"
+
+    def branch(self, tag: str) -> str:
+        return self.branch_prefix + tag
+
+
+def parse_entry(d: dict, index: int) -> Entry:
+    where = f"{FEATURE}[{index}]"
+    if not isinstance(d, dict):
+        raise Error(f"{where}: must be a mapping")
+    entry_id = _get(d, "id", str, required=True, where=where)
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", entry_id):
+        raise Error(f"{where}: invalid id '{entry_id}'")
+    where = f"{FEATURE}[{entry_id}]"
+    series = _get(d, "series", str, required=True, where=where)
+    if os.path.basename(series) != "series.inc":
+        raise Error(f"{where}: 'series' must point to the series.inc written by "
+                    "'umpf format-patch --bb'")
+
+    upstream = _get(d, "upstream", dict, {}, where=where)
+    tarball = _get(d, "tarball", dict, {}, where=where)
+    kconfig = _get(d, "kconfig", dict, {}, where=where)
+    commit = _get(d, "commit-message", dict, {}, where=where)
+
+    sdk = None
+    sdk_d = _get(d, "sdk", dict, None, where=where)
+    if sdk_d is not None:
+        sdk_where = f"{where}.sdk"
+        sdk = Sdk(installer=_get(sdk_d, "installer", str, where=sdk_where),
+                  sha256=_get(sdk_d, "sha256", str, where=sdk_where),
+                  path=_get(sdk_d, "path", str, where=sdk_where),
+                  environment_setup=_get(sdk_d, "environment-setup", str,
+                                         "environment-setup-*", where=sdk_where),
+                  env={str(k): str(v) for k, v in
+                       _get(sdk_d, "env", dict, {}, where=sdk_where).items()})
+        if sdk.installer and sdk.path:
+            raise Error(f"{sdk_where}: 'installer' and 'path' are mutually exclusive")
+
+    pending = _get(d, "pending", str, "stack", where=where)
+    if pending not in ("stack", "supersede"):
+        raise Error(f"{where}: 'pending' must be 'stack' or 'supersede'")
+
+    if tarball and not d.get("recipe"):
+        raise Error(f"{where}: 'tarball' requires 'recipe'")
+    defconfig = _get(kconfig, "defconfig", str, where=f"{where}.kconfig")
+    if kconfig and not defconfig:
+        raise Error(f"{where}.kconfig: 'defconfig' is required")
+
+    return Entry(
+        id=entry_id,
+        series=series,
+        recipe=_get(d, "recipe", str, where=where),
+        repository=_get(d, "repository", str, required=True, where=where),
+        compare_url=_get(d, "compare-url", str, where=where),
+        upstream=_get(upstream, "repository", str, where=f"{where}.upstream"),
+        tag_prefix=_get(upstream, "tag-prefix", str, "v", where=f"{where}.upstream"),
+        stable_version_parts=_get(upstream, "stable-version-parts", int, 2,
+                                  where=f"{where}.upstream"),
+        stable_release_regex=_get(upstream, "stable-release-regex", str,
+                                  where=f"{where}.upstream"),
+        changelog_url=_get(upstream, "changelog-url", str, where=f"{where}.upstream"),
+        tarball_url=_get(tarball, "url", str, where=f"{where}.tarball"),
+        checksum_name=_get(tarball, "checksum-name", str, where=f"{where}.tarball"),
+        defconfig=defconfig,
+        savedefconfig=_get(kconfig, "savedefconfig", bool, False, where=f"{where}.kconfig"),
+        make_args=[str(a) for a in _get(kconfig, "make-args", list, [],
+                                        where=f"{where}.kconfig")],
+        sdk=sdk,
+        tag_version=_get(d, "tag-version", int, 90, where=where),
+        target_branch=_get(d, "target-branch", str, where=where),
+        pending=pending,
+        open_pull_requests_limit=_get(d, "open-pull-requests-limit", int, 5, where=where),
+        labels=[str(x) for x in _get(d, "labels", list, [], where=where)],
+        reviewers=[str(x) for x in _get(d, "reviewers", list, [], where=where)],
+        assignees=[str(x) for x in _get(d, "assignees", list, [], where=where)],
+        commit_prefix=_get(commit, "prefix", str, f"{entry_id}: ",
+                           where=f"{where}.commit-message"),
+        signoff=_get(commit, "signoff", bool, False, where=f"{where}.commit-message"),
+    )
+
+
+@dataclasses.dataclass
+class Config:
+    author: str
+    umpf_repository: str
+    umpf_version: str | None
+    entries: list[Entry]
+
+
+def load_config(path: str) -> Config:
+    try:
+        with open(path) as f:
+            data = yaml.safe_load(f) or {}
+    except OSError as e:
+        raise Error(f"cannot read config: {e}") from e
+    except yaml.YAMLError as e:
+        raise Error(f"invalid config {path}: {e}") from e
+    if not isinstance(data, dict):
+        raise Error(f"{path}: must be a mapping")
+    if data.get("version", 1) != 1:
+        raise Error(f"{path}: unsupported version {data.get('version')}")
+    author = _get(data, "author", str, DEFAULT_AUTHOR, where=path)
+    umpf = _get(data, "umpf", dict, {}, where=path)
+    umpf_version = _get(umpf, "version", str, where=f"{path}: umpf")
+    if umpf_version is not None and (not umpf_version or umpf_version.startswith("-")):
+        raise Error(f"{path}: umpf: invalid version '{umpf_version}'")
+    entries = [parse_entry(d, i) for i, d in enumerate(
+        _get(data, FEATURE, list, [], where=path))]
+    ids = [e.id for e in entries]
+    if len(ids) != len(set(ids)):
+        raise Error(f"{path}: duplicate {FEATURE} ids")
+    return Config(author=author,
+                  umpf_repository=_get(umpf, "repository", str, DEFAULT_UMPF_REPOSITORY,
+                                       where=f"{path}: umpf"),
+                  umpf_version=umpf_version, entries=entries)
+
+
+### umpf series ###
+
+class Series:
+    """a qualified useries, e.g. the series.inc of 'umpf format-patch --bb'"""
+
+    def __init__(self, text: str, where: str):
+        self.text = text
+        self.where = where
+        for key in ("base", "name", "version"):
+            if self.get(key) is None:
+                raise Error(f"{where}: no 'umpf-{key}' found. Is this a series of a utag?")
+
+    def get(self, key: str) -> str | None:
+        m = re.search(rf"^# umpf-{key}: *(.*?)\s*$", self.text, re.M)
+        return m.group(1) if m else None
+
+    @property
+    def base(self) -> str:
+        return self.get("base")
+
+    @property
+    def name(self) -> str:
+        return self.get("name")
+
+    @property
+    def version(self) -> str:
+        """the utag this series was created from"""
+        return self.get("version")
+
+    def with_umpf_base(self, base: str) -> str:
+        """only point UMPF_BASE to a new base, like 'umpf format-patch --bb' would"""
+        text, n = re.subn(r'^(UMPF_BASE\s*=\s*")[^"]*(")',
+                          lambda m: m.group(1) + base.replace("v", "") + m.group(2),
+                          self.text, flags=re.M)
+        if n != 1:
+            raise Error(f"{self.where}: expected exactly one UMPF_BASE assignment")
+        return text
+
+
+def update_checksum(text: str, name: str | None, sha256: str, where: str) -> str:
+    key = f"{name}.sha256sum" if name else "sha256sum"
+    patterns = [re.compile(r'^(\s*SRC_URI\[' + re.escape(key) +
+                           r'\]\s*[?:]?=\s*")[0-9a-fA-F]{64}(")', re.M)]
+    if not name:
+        patterns.append(re.compile(r"(;sha256sum=)[0-9a-fA-F]{64}()"))
+    matches = sum(len(p.findall(text)) for p in patterns)
+    if matches != 1:
+        raise Error(f"{where}: expected exactly one SRC_URI checksum for '{key}', "
+                    f"found {matches}. Set 'tarball.checksum-name'?")
+    for p in patterns:
+        text = p.sub(lambda m: m.group(1) + sha256 + m.group(2), text)
+    return text
+
+
+### forge ###
+
+@dataclasses.dataclass
+class PullRequest:
+    number: int
+    title: str
+    body: str
+    head: str
+    head_sha: str
+    base: str
+    state: str
+    merged: bool
+    draft: bool
+    url: str
+    node_id: str = ""
+    mergeable: bool | None = None
+
+    @property
+    def meta(self) -> dict | None:
+        m = METADATA_RE.search(self.body or "")
+        if not m:
+            return None
+        try:
+            return json.loads(m.group(1))
+        except json.JSONDecodeError:
+            return None
+
+    @property
+    def edited(self) -> bool:
+        """pushed to by someone else since umpfabot last updated it"""
+        meta = self.meta
+        return meta is None or meta.get("head") != self.head_sha
+
+    def target(self, prefix: str) -> str:
+        meta = self.meta
+        if meta and meta.get("to", {}).get("base"):
+            return meta["to"]["base"]
+        return self.head[len(prefix):]
+
+
+class GitHub:
+    def __init__(self, repo: str, token: str | None, api_url: str, graphql_url: str,
+                 dry_run: bool):
+        self.repo = repo
+        self.token = token
+        self.api_url = api_url.rstrip("/")
+        self.graphql_url = graphql_url
+        self.dry_run = dry_run
+        self.owner = repo.split("/")[0]
+
+    def request(self, method: str, url: str, data=None):
+        if not url.startswith("http"):
+            url = f"{self.api_url}/{url.lstrip('/')}"
+        headers = {"Accept": "application/vnd.github+json",
+                   "X-GitHub-Api-Version": "2022-11-28",
+                   "User-Agent": "umpfabot"}
+        if self.token:
+            headers["Authorization"] = f"Bearer {self.token}"
+        body = None
+        if data is not None:
+            body = json.dumps(data).encode()
+            headers["Content-Type"] = "application/json"
+        if VERBOSE:
+            info(f"+ {method} {url}")
+        req = urllib.request.Request(url, data=body, headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(req) as resp:
+                content = resp.read()
+                return json.loads(content) if content else None, resp.headers
+        except urllib.error.HTTPError as e:
+            raise Error(f"{method} {url} failed: {e.code} {e.reason}: "
+                        f"{e.read().decode(errors='replace')}") from e
+
+    def paginate(self, path: str) -> list:
+        sep = "&" if "?" in path else "?"
+        url = f"{path}{sep}per_page=100"
+        items = []
+        while url:
+            data, headers = self.request("GET", url)
+            items += data
+            m = re.search(r'<([^>]+)>;\s*rel="next"', headers.get("Link") or "")
+            url = m.group(1) if m else None
+        return items
+
+    def _pr(self, d: dict) -> PullRequest:
+        return PullRequest(number=d["number"], title=d["title"], body=d.get("body") or "",
+                           head=d["head"]["ref"], head_sha=d["head"]["sha"],
+                           base=d["base"]["ref"], state=d["state"],
+                           merged=bool(d.get("merged_at")), draft=bool(d.get("draft")),
+                           url=d["html_url"], node_id=d.get("node_id", ""),
+                           mergeable=d.get("mergeable"))
+
+    def default_branch(self) -> str:
+        return self.request("GET", f"repos/{self.repo}")[0]["default_branch"]
+
+    def pulls(self, prefix: str) -> list[PullRequest]:
+        """open pull requests from branches starting with prefix in this repository"""
+        prs = []
+        for d in self.paginate(f"repos/{self.repo}/pulls?state=open"):
+            repo = (d["head"].get("repo") or {}).get("full_name")
+            if repo == self.repo and d["head"]["ref"].startswith(prefix):
+                # only the single pull request API reports mergeability
+                prs.append(self._pr(self.request(
+                    "GET", f"repos/{self.repo}/pulls/{d['number']}")[0]))
+        return prs
+
+    def closed_pulls(self, branch: str) -> list[PullRequest]:
+        head = urllib.parse.quote(f"{self.owner}:{branch}")
+        return [self._pr(d) for d in
+                self.paginate(f"repos/{self.repo}/pulls?state=closed&head={head}")]
+
+    def create_pull(self, head: str, base: str, title: str, body: str,
+                    draft: bool) -> PullRequest:
+        data = self.request("POST", f"repos/{self.repo}/pulls", {
+            "head": head, "base": base, "title": title, "body": body, "draft": draft,
+            "maintainer_can_modify": True})[0]
+        return self._pr(data)
+
+    def update_pull(self, pr: PullRequest, **fields) -> None:
+        self.request("PATCH", f"repos/{self.repo}/pulls/{pr.number}", fields)
+
+    def set_draft(self, pr: PullRequest, draft: bool) -> None:
+        mutation = "convertPullRequestToDraft" if draft else "markPullRequestReadyForReview"
+        query = (f"mutation($id: ID!) {{ {mutation}(input: {{pullRequestId: $id}}) "
+                 "{ clientMutationId } }")
+        data, _ = self.request("POST", self.graphql_url,
+                               {"query": query, "variables": {"id": pr.node_id}})
+        if data and data.get("errors"):
+            raise Error(f"{mutation} failed: {data['errors']}")
+
+    def comments(self, pr: PullRequest) -> list[str]:
+        return [c["body"] for c in
+                self.paginate(f"repos/{self.repo}/issues/{pr.number}/comments")]
+
+    def comment(self, pr: PullRequest, body: str) -> None:
+        self.request("POST", f"repos/{self.repo}/issues/{pr.number}/comments", {"body": body})
+
+    def decorate(self, pr: PullRequest, labels: list[str], reviewers: list[str],
+                 assignees: list[str]) -> None:
+        if labels:
+            self.request("POST", f"repos/{self.repo}/issues/{pr.number}/labels",
+                         {"labels": labels})
+        if assignees:
+            self.request("POST", f"repos/{self.repo}/issues/{pr.number}/assignees",
+                         {"assignees": assignees})
+        if reviewers:
+            self.request("POST", f"repos/{self.repo}/pulls/{pr.number}/requested_reviewers", {
+                "reviewers": [r for r in reviewers if "/" not in r],
+                "team_reviewers": [r.split("/", 1)[1] for r in reviewers if "/" in r]})
+
+
+class LocalForge:
+    """pull requests kept in a JSON file, for testing and offline use
+
+    Head commits are looked up in the BSP remote, like on a real forge."""
+
+    def __init__(self, path: str, remote_heads):
+        self.path = path
+        self.remote_heads = remote_heads
+        self.dry_run = False
+        if os.path.exists(path):
+            with open(path) as f:
+                self.state = json.load(f)
+        else:
+            self.state = {}
+        self.state.setdefault("default_branch", "main")
+        self.state.setdefault("pulls", [])
+        self.state.setdefault("comments", {})
+
+    def save(self) -> None:
+        with open(self.path, "w") as f:
+            json.dump(self.state, f, indent=2)
+
+    def _pr(self, d: dict) -> PullRequest:
+        if d["state"] == "open":
+            d["head_sha"] = self.remote_heads().get(d["head"], d["head_sha"])
+        return PullRequest(number=d["number"], title=d["title"], body=d["body"],
+                           head=d["head"], head_sha=d["head_sha"], base=d["base"],
+                           state=d["state"], merged=d.get("merged", False),
+                           draft=d.get("draft", False), url=f"local:{d['number']}",
+                           mergeable=d.get("mergeable"))
+
+    def _find(self, pr: PullRequest) -> dict:
+        return next(d for d in self.state["pulls"] if d["number"] == pr.number)
+
+    def default_branch(self) -> str:
+        return self.state["default_branch"]
+
+    def pulls(self, prefix: str) -> list[PullRequest]:
+        return [self._pr(d) for d in self.state["pulls"]
+                if d["state"] == "open" and d["head"].startswith(prefix)]
+
+    def closed_pulls(self, branch: str) -> list[PullRequest]:
+        return [self._pr(d) for d in self.state["pulls"]
+                if d["state"] == "closed" and d["head"] == branch]
+
+    def create_pull(self, head, base, title, body, draft) -> PullRequest:
+        d = {"number": len(self.state["pulls"]) + 1, "title": title, "body": body,
+             "head": head, "head_sha": self.remote_heads()[head], "base": base,
+             "state": "open", "merged": False, "draft": draft, "labels": [],
+             "reviewers": [], "assignees": []}
+        self.state["pulls"].append(d)
+        self.save()
+        return self._pr(d)
+
+    def update_pull(self, pr: PullRequest, **fields) -> None:
+        self._find(pr).update(fields)
+        self.save()
+
+    def set_draft(self, pr: PullRequest, draft: bool) -> None:
+        self._find(pr)["draft"] = draft
+        self.save()
+
+    def comments(self, pr: PullRequest) -> list[str]:
+        return self.state["comments"].get(str(pr.number), [])
+
+    def comment(self, pr: PullRequest, body: str) -> None:
+        self.state["comments"].setdefault(str(pr.number), []).append(body)
+        self.save()
+
+    def decorate(self, pr: PullRequest, labels, reviewers, assignees) -> None:
+        d = self._find(pr)
+        d["labels"] += labels
+        d["reviewers"] += reviewers
+        d["assignees"] += assignees
+        self.save()
+
+
+class DryRunForge:
+    """read from the real forge, but only report modifications"""
+
+    def __init__(self, forge):
+        self.forge = forge
+        self.dry_run = True
+        self.number = 0
+
+    def default_branch(self):
+        return self.forge.default_branch()
+
+    def pulls(self, prefix):
+        return self.forge.pulls(prefix)
+
+    def closed_pulls(self, branch):
+        return self.forge.closed_pulls(branch)
+
+    def comments(self, pr):
+        return self.forge.comments(pr) if pr.number > 0 else []
+
+    def create_pull(self, head, base, title, body, draft) -> PullRequest:
+        self.number -= 1
+        info(f"dry-run: would create {'draft ' if draft else ''}pull request "
+             f"'{title}' from {head} to {base}")
+        return PullRequest(number=self.number, title=title, body=body, head=head,
+                           head_sha="", base=base, state="open", merged=False,
+                           draft=draft, url="(dry-run)")
+
+    def update_pull(self, pr, **fields):
+        info(f"dry-run: would update #{pr.number}: {', '.join(fields)}")
+
+    def set_draft(self, pr, draft):
+        info(f"dry-run: would mark #{pr.number} as {'draft' if draft else 'ready'}")
+
+    def comment(self, pr, body):
+        info(f"dry-run: would comment on #{pr.number}: {body.splitlines()[0]}")
+
+    def decorate(self, pr, labels, reviewers, assignees):
+        pass
+
+
+def comment_once(forge, pr: PullRequest, key: str, body: str) -> None:
+    """comment unless a comment with the same key was posted before"""
+    marker = f"<!-- umpfabot-comment: {key} -->"
+    if any(marker in c for c in forge.comments(pr)):
+        return
+    forge.comment(pr, f"{body}\n\n{marker}")
+
+
+### the umpf repository ###
+
+@dataclasses.dataclass
+class Conflict:
+    topic: str | None
+    commit: str | None
+    files: list[str]
+    log: str
+
+
+class UmpfConflict(Exception):
+    def __init__(self, conflict: Conflict):
+        super().__init__("conflict")
+        self.conflict = conflict
+
+
+class UmpfRepo:
+    """umpfabot's own clone of the repository the umpf tags live in"""
+
+    def __init__(self, ctx: Context, url: str):
+        self.ctx = ctx
+        self.url = url
+        slug = re.sub(r"[^A-Za-z0-9._-]+", "_", url).strip("_")
+        self.path = os.path.join(ctx.work_dir, "repos", slug)
+        self.git = Git(self.path, ctx.git_env)
+        self.fetched = False
+
+    def prepare(self) -> None:
+        if self.fetched:
+            return
+        if not os.path.isdir(os.path.join(self.path, ".git")):
+            os.makedirs(self.path, exist_ok=True)
+            self.git("init", "-q")
+            self.git("remote", "add", "origin", self.url)
+            # like 'git clone --filter=blob:none': file contents are only
+            # fetched when needed, a full history of Linux is big
+            self.git("config", "remote.origin.promisor", "true")
+            self.git("config", "remote.origin.partialclonefilter", "blob:none")
+        name, email = parse_author(self.ctx.author)
+        self.git("config", "user.name", name)
+        self.git("config", "user.email", email)
+        self.git("config", "remote.origin.url", self.url)
+        self.reset()
+        info(f"fetching {self.url}...")
+        # prune to forget tags of unpublished (dry-run) or failed runs
+        self.git("fetch", "-q", "--prune", "--no-tags", "origin", "+refs/tags/*:refs/tags/*",
+                 "+refs/heads/*:refs/remotes/origin/*")
+        self.fetched = True
+
+    def reset(self) -> None:
+        if os.path.isdir(os.path.join(self.path, ".git", "umpf")):
+            self.umpf("abort", check=False)
+        for state in ("rebase-merge", "rebase-apply"):
+            if os.path.isdir(os.path.join(self.path, ".git", state)):
+                self.git("rebase", "--abort", check=False)
+        if self.git.rev("HEAD"):
+            self.git("checkout", "-q", "-f", "--detach")
+            self.git("clean", "-q", "-f", "-d", "-x")
+
+    def umpf(self, *args: str, check: bool = True,
+             env: dict | None = None) -> subprocess.CompletedProcess:
+        return run([self.ctx.umpf, *args], cwd=self.path, env=env or self.git.env,
+                   check=check, input="")
+
+    def has_tag(self, tag: str) -> bool:
+        return self.git.rev(f"refs/tags/{tag}") is not None
+
+    def ensure_tag(self, tag: str, upstream: str | None) -> None:
+        """make sure a base tag exists locally, fetching it from upstream if needed"""
+        if self.has_tag(tag):
+            return
+        if upstream:
+            info(f"fetching {tag} from {upstream}...")
+            self.git("fetch", "-q", "--no-tags", upstream, f"+refs/tags/{tag}:refs/tags/{tag}")
+        else:
+            raise Error(f"tag {tag} not found in {self.url}")
+
+    def missing_remote_tags(self, tags: list[str]) -> list[str]:
+        present = self.git.remote_refs("origin", *[f"refs/tags/{t}" for t in tags])
+        return [t for t in tags if f"refs/tags/{t}" not in present]
+
+    def free_version(self, name: str, date: str, start: int) -> int:
+        """the first unused -v <version> >= start for an umpf tag of today"""
+        used = set()
+        for tag in self.git("tag", "-l", f"{name}/{date}*").splitlines():
+            m = re.fullmatch(re.escape(f"{name}/{date}") + r"[-.](\d+)(-flat)?", tag)
+            if m:
+                used.add(int(m.group(1)))
+        version = start
+        while version in used:
+            version += 1
+        return version
+
+    def tag(self, series_file: str, base: str, version: int, epoch: int) -> str:
+        """run 'umpf tag' and return the new utag
+
+        Raises UmpfConflict if the topics don't apply on base."""
+        env = dict(self.git.env, SOURCE_DATE_EPOCH=str(epoch), TZ="UTC")
+        proc = self.umpf("--default", "--identical", f"--base={base}",
+                         f"--version={version}", "tag", series_file, check=False, env=env)
+        log = proc.stdout + proc.stderr
+        if VERBOSE or proc.returncode != 0:
+            print(log, file=sys.stderr)
+        if proc.returncode == 0:
+            m = re.search(r"^# umpf-version: (\S+)$", proc.stdout, re.M)
+            if not m or not self.has_tag(m.group(1)):
+                raise Error(f"umpf tag did not create a tag:\n{log}")
+            return m.group(1)
+        files = self.git("diff", "--name-only", "--diff-filter=U").split()
+        commit = None
+        if self.git.rev("REBASE_HEAD"):
+            commit = self.git("log", "-1", "--abbrev=12", "--format=%h (\"%s\")",
+                              "REBASE_HEAD")
+        topic = None
+        for m in re.finditer(r"^# umpf-(?:squash-)?topic: (.*)$", proc.stdout, re.M):
+            topic = m.group(1)
+        self.umpf("abort", check=False)
+        self.reset()
+        if commit or files:
+            raise UmpfConflict(Conflict(topic=topic, commit=commit, files=files, log=log))
+        raise Error(f"umpf tag failed:\n{log}")
+
+
+def umpf_patches() -> list[str]:
+    """patches for umpf that are not upstream yet, applied to the newest umpf"""
+    here = os.path.dirname(os.path.realpath(__file__))
+    for path in (os.path.join(here, "patches"),
+                 os.path.join(here, os.pardir, "share", "umpfabot", "patches")):
+        if os.path.isdir(path):
+            return sorted(glob.glob(os.path.join(path, "*.patch")))
+    return []
+
+
+def parse_author(author: str) -> tuple[str, str]:
+    m = re.fullmatch(r"\s*(.*?)\s*<([^>]+)>\s*", author)
+    if not m:
+        raise Error(f"invalid author '{author}', expected 'Name <email>'")
+    return m.group(1), m.group(2)
+
+
+def web_url(url: str) -> str | None:
+    m = re.fullmatch(r"(?:https://|ssh://git@|git@)(github\.com)[:/](.+?)(?:\.git)?/?", url)
+    return f"https://{m.group(1)}/{m.group(2)}" if m else None
+
+
+### context ###
+
+class Context:
+    def __init__(self, args):
+        self.dry_run = args.dry_run
+        self.bsp_dir = os.path.abspath(args.bsp_dir)
+        self.bsp_remote = args.bsp_remote
+        self.work_dir = os.path.abspath(args.work_dir)
+        os.makedirs(self.work_dir, exist_ok=True)
+        self.token = (args.token or os.environ.get("UMPFABOT_TOKEN") or
+                      os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN"))
+        server_url = os.environ.get("GITHUB_SERVER_URL", "https://github.com")
+        self.git_env = git_env(self.token, server_url)
+        self.bsp = Git(self.bsp_dir, self.git_env)
+        if not self.bsp.ok("rev-parse", "--git-dir"):
+            raise Error(f"{self.bsp_dir} is not a git repository")
+        self.umpf_path = args.umpf
+
+        self.config = load_config(args.config or os.path.join(self.bsp_dir, DEFAULT_CONFIG))
+        self.author = self.config.author
+        self.entries = self.config.entries
+        # commits and tags are created by umpfabot, whatever the environment says
+        name, email = parse_author(self.author)
+        self.git_env.update(GIT_AUTHOR_NAME=name, GIT_AUTHOR_EMAIL=email,
+                            GIT_COMMITTER_NAME=name, GIT_COMMITTER_EMAIL=email)
+        self.repos: dict[str, UmpfRepo] = {}
+        self.remote_tags: dict[str, dict[str, str]] = {}
+        self.sha256_cache_file = os.path.join(self.work_dir, "sha256.json")
+
+        if args.forge_state:
+            forge = LocalForge(args.forge_state, self.bsp_heads)
+        else:
+            repo = args.repo or os.environ.get("GITHUB_REPOSITORY") or self.repo_from_remote()
+            api_url = os.environ.get("GITHUB_API_URL", "https://api.github.com")
+            graphql_url = os.environ.get("GITHUB_GRAPHQL_URL") or (
+                "https://api.github.com/graphql" if api_url == "https://api.github.com"
+                else re.sub(r"/v3/?$", "/graphql", api_url))
+            if not self.token:
+                raise Error("no GitHub token: use --token or set UMPFABOT_TOKEN")
+            forge = GitHub(repo, self.token, api_url, graphql_url, self.dry_run)
+        self.forge = DryRunForge(forge) if self.dry_run else forge
+        # BSP branches staged in this run (only differs from the remote in dry-run)
+        self.tips: dict[str, str] = {}
+
+    def repo_from_remote(self) -> str:
+        url = self.bsp("remote", "get-url", self.bsp_remote)
+        web = web_url(url)
+        if not web:
+            raise Error(f"cannot derive the GitHub repository from '{url}', use --repo")
+        return web.split("/", 3)[3]
+
+    def bsp_heads(self) -> dict[str, str]:
+        refs = self.bsp.remote_refs(self.bsp_remote, "refs/heads/*")
+        return {ref[len("refs/heads/"):]: sha for ref, sha in refs.items()}
+
+    @functools.cached_property
+    def umpf(self) -> str:
+        """the umpf executable: --umpf or the configured version"""
+        if self.umpf_path:
+            path = self.umpf_path
+            if os.sep not in path:
+                path = shutil.which(path) or path
+            if not os.access(path, os.X_OK):
+                raise Error(f"umpf executable '{self.umpf_path}' not found")
+            return os.path.abspath(path)
+        return self.fetch_umpf(self.config.umpf_repository, self.config.umpf_version)
+
+    def fetch_umpf(self, repository: str, version: str | None) -> str:
+        """the umpf script of a commit-ish in the umpf repository or, without a
+        version, of the newest umpf with umpfabot's patches. Cached by commit."""
+        cache = os.path.join(self.work_dir, "umpf")
+        git = Git(os.path.join(cache, "git"), self.git_env)
+        if not os.path.isdir(git.path):
+            os.makedirs(git.path)
+            git("init", "-q", "--bare")
+        if version is None:
+            info(f"fetching the newest umpf from {repository}...")
+            git("fetch", "-q", "--no-tags", repository, "HEAD")
+            sha = git.rev("FETCH_HEAD")
+        # a pinned commit needs no network once it was fetched
+        elif re.fullmatch(r"[0-9a-f]{40}", version) and git.rev(version):
+            sha = version
+        else:
+            info(f"fetching umpf {version} from {repository}...")
+            git("fetch", "-q", "--prune", "--no-tags", repository,
+                "+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*")
+            sha = git.rev(version)
+            if not sha and git.ok("fetch", "-q", "--no-tags", repository, version):
+                # e.g. a commit only reachable from a pull request
+                sha = git.rev("FETCH_HEAD")
+            if not sha:
+                raise Error(f"umpf version '{version}' not found in {repository}")
+        script = git.show(sha, "umpf")
+        if script is None:
+            raise Error(f"{repository} has no umpf in {version or sha}")
+        name = sha
+        desc = f"umpf {sha[:12]}" + (f" ({version})" if version and version != sha else "")
+        patched = self.patch_umpf(git, sha) if version is None else None
+        if patched:
+            applied, script = patched
+            name += "-" + hashlib.sha256(script.encode()).hexdigest()[:12]
+            desc += " with " + ", ".join(applied)
+        path = os.path.join(cache, name, "umpf")
+        if not os.path.exists(path):
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path + ".tmp", "w") as f:
+                f.write(script)
+            os.chmod(path + ".tmp", 0o755)
+            os.replace(path + ".tmp", path)
+        info(f"using {desc}")
+        return path
+
+    def patch_umpf(self, git: Git, sha: str) -> tuple[list[str], str] | None:
+        """the umpf of commit sha with those patches of umpfabot that are not
+        upstream yet, None if there are none or they don't apply"""
+        applied = []
+        with tempfile.TemporaryDirectory(dir=self.work_dir) as tmp:
+            # in a temporary index, the cache is a bare repository
+            index = Git(git.path, dict(git.env, GIT_INDEX_FILE=os.path.join(tmp, "index")))
+            index("read-tree", sha)
+            for patch in umpf_patches():
+                name = os.path.basename(patch)
+                apply = ["apply", "--cached", "--include=umpf"]
+                if index.ok(*apply, "--check", "--reverse", patch):
+                    continue
+                proc = run(["git", *apply, "--3way", patch], cwd=git.path, env=index.env,
+                           check=False)
+                if proc.returncode != 0:
+                    info(proc.stderr.strip())
+                    warning(f"{name} does not apply on umpf {sha[:12]}, "
+                            "using umpf without patches")
+                    return None
+                applied.append(name)
+            return (applied, index.show("", "umpf")) if applied else None
+
+    @functools.cached_property
+    def umpf_range_diff(self) -> bool:
+        """'umpf range-diff' is not available in older umpf versions"""
+        proc = run([self.umpf, "--help"], check=False)
+        if re.search(r"^\s+range-diff\s", proc.stdout, re.M):
+            return True
+        info("umpf has no range-diff command, skipping it")
+        return False
+
+    def umpf_repo(self, url: str) -> UmpfRepo:
+        if url not in self.repos:
+            self.repos[url] = UmpfRepo(self, url)
+        self.repos[url].prepare()
+        return self.repos[url]
+
+    def tip(self, branch: str) -> str:
+        if branch in self.tips:
+            return self.tips[branch]
+        rev = self.bsp.rev(f"refs/remotes/{self.bsp_remote}/{branch}")
+        if not rev:
+            raise Error(f"branch {branch} not found in {self.bsp_remote}")
+        return rev
+
+    def sha256(self, url: str) -> str | None:
+        """checksum of a (release) download, None if not available (yet)"""
+        cache = {}
+        if os.path.exists(self.sha256_cache_file):
+            with open(self.sha256_cache_file) as f:
+                cache = json.load(f)
+        if url in cache:
+            return cache[url]
+        info(f"downloading {url}...")
+        h = hashlib.sha256()
+        try:
+            with urllib.request.urlopen(url) as resp:
+                while chunk := resp.read(1 << 20):
+                    h.update(chunk)
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                return None
+            raise Error(f"downloading {url} failed: {e}") from e
+        except urllib.error.URLError as e:
+            if isinstance(e.reason, FileNotFoundError):
+                return None
+            raise Error(f"downloading {url} failed: {e}") from e
+        cache[url] = h.hexdigest()
+        with open(self.sha256_cache_file, "w") as f:
+            json.dump(cache, f, indent=2)
+        return cache[url]
+
+    def sdk_environment_setup(self, sdk: Sdk) -> str | None:
+        root = sdk.path
+        if sdk.installer:
+            key = sdk.sha256 or hashlib.sha256(sdk.installer.encode()).hexdigest()
+            root = os.path.join(self.work_dir, "sdk", key[:16])
+            if not os.path.exists(os.path.join(root, ".umpfabot-installed")):
+                self.install_sdk(sdk, root)
+        if not root:
+            return None
+        matches = glob.glob(os.path.join(root, sdk.environment_setup))
+        if len(matches) != 1:
+            raise Error(f"expected one '{sdk.environment_setup}' in {root}, "
+                        f"found {len(matches)}")
+        return matches[0]
+
+    def install_sdk(self, sdk: Sdk, root: str) -> None:
+        with tempfile.TemporaryDirectory(dir=self.work_dir) as tmp:
+            installer = sdk.installer
+            if re.match(r"^[a-z]+://", installer):
+                info(f"downloading SDK {installer}...")
+                local = os.path.join(tmp, "sdk.sh")
+                with urllib.request.urlopen(installer) as resp, open(local, "wb") as f:
+                    shutil.copyfileobj(resp, f)
+                installer = local
+            if sdk.sha256:
+                with open(installer, "rb") as f:
+                    digest = hashlib.file_digest(f, "sha256").hexdigest() \
+                        if hasattr(hashlib, "file_digest") else \
+                        hashlib.sha256(f.read()).hexdigest()
+                if digest != sdk.sha256:
+                    raise Error(f"SDK installer checksum mismatch: {digest}")
+            shutil.rmtree(root, ignore_errors=True)
+            info(f"installing SDK to {root}...")
+            run(["sh", installer, "-y", "-d", root])
+            open(os.path.join(root, ".umpfabot-installed"), "w").close()
+
+
+### stable-update ###
+
+@dataclasses.dataclass
+class Staged:
+    """a BSP commit for an update, ready to be published"""
+    commit: str
+    old: Series
+    base: str
+    utag: str | None
+    conflict: Conflict | None
+    kconfig_diff: str | None
+    range_diff: str | None
+    push_tags: list[str]
+
+
+def truncate(text: str, limit: int = MAX_SECTION) -> str:
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "\n[... truncated]"
+
+
+class StableUpdate:
+    def __init__(self, ctx: Context, entry: Entry):
+        self.ctx = ctx
+        self.entry = entry
+        self.prs: list[PullRequest] = []
+
+    ### discovery ###
+
+    def strip_prefix(self, tag: str) -> str | None:
+        prefix = self.entry.tag_prefix
+        return tag[len(prefix):] if tag.startswith(prefix) else None
+
+    def stable_regex(self, base: str) -> re.Pattern:
+        if self.entry.stable_release_regex:
+            return re.compile(self.entry.stable_release_regex)
+        version = self.strip_prefix(base)
+        if version is None:
+            raise Error(f"{self.entry.id}: umpf-base '{base}' does not start with "
+                        f"'{self.entry.tag_prefix}'")
+        # like upstream-stable-release-point.bbclass in oe-core
+        parts = version.split(".")[:self.entry.stable_version_parts]
+        return re.compile("^" + r"\.".join(map(re.escape, parts)) + r"(\.\d+)*$")
+
+    def stable_tags(self, base: str) -> list[str]:
+        """all stable releases of the series of base, oldest first"""
+        regex = self.stable_regex(base)
+        url = self.entry.upstream or self.entry.repository
+        if url not in self.ctx.remote_tags:
+            self.ctx.remote_tags[url] = self.ctx.bsp.remote_refs(
+                url, f"refs/tags/{self.entry.tag_prefix}*")
+        refs = self.ctx.remote_tags[url]
+        tags = []
+        for ref in refs:
+            tag = ref[len("refs/tags/"):]
+            version = self.strip_prefix(tag)
+            if version is not None and regex.search(version):
+                tags.append(tag)
+        return sorted(tags, key=lambda t: version_key(self.strip_prefix(t)))
+
+    def newer(self, a: str, b: str) -> bool:
+        return version_key(self.strip_prefix(a) or a) > version_key(self.strip_prefix(b) or b)
+
+    ### staging ###
+
+    def tarball_sha256(self, tag: str) -> str | None:
+        if not self.entry.tarball_url:
+            return None
+        url = format_url(self.entry.tarball_url, tag, self.strip_prefix(tag), self.entry.id)
+        sha = self.ctx.sha256(url)
+        if sha is None:
+            raise Error(f"{url} is not available (yet)")
+        return sha
+
+    def stage(self, parent: str, base: str, reuse_utag: str | None = None) -> Staged:
+        """create the BSP commit updating the umpf of parent to base"""
+        entry = self.entry
+        bsp = self.ctx.bsp
+        text = bsp.show(parent, entry.series)
+        if text is None:
+            raise Error(f"{entry.series} not found in {parent}")
+        old = Series(text, entry.series)
+        repo = self.ctx.umpf_repo(entry.repository)
+        repo.ensure_tag(old.base, entry.upstream)
+        repo.ensure_tag(base, entry.upstream)
+        sha256 = self.tarball_sha256(base)
+
+        series_file = os.path.join(self.ctx.work_dir, f"{entry.id}.series.inc")
+        with open(series_file, "w") as f:
+            f.write(old.text)
+
+        conflict = None
+        utag = reuse_utag if reuse_utag and repo.has_tag(reuse_utag) else None
+        if not utag:
+            epoch = int(time.time())
+            date = time.strftime("%Y%m%d", time.gmtime(epoch))
+            version = repo.free_version(old.name, date, entry.tag_version)
+            info(f"{entry.id}: rebasing {old.version} onto {base}...")
+            try:
+                utag = repo.tag(series_file, base, version, epoch)
+            except UmpfConflict as e:
+                conflict = e.conflict
+
+        worktree = tempfile.mkdtemp(prefix=f"{entry.id}-", dir=self.ctx.work_dir)
+        bsp("worktree", "add", "-q", "--detach", worktree, parent)
+        try:
+            kconfig_diff = range_diff = None
+            series_path = os.path.join(worktree, entry.series)
+            if conflict:
+                with open(series_path, "w") as f:
+                    f.write(old.with_umpf_base(base))
+            else:
+                repo.umpf("format-patch", "--bb", "--update",
+                          f"--patchdir={os.path.join(worktree, entry.patch_dir)}", utag)
+                if entry.defconfig:
+                    kconfig_diff = self.olddefconfig(repo, utag,
+                                                     os.path.join(worktree, entry.defconfig))
+                if self.ctx.umpf_range_diff:
+                    proc = repo.umpf("range-diff", series_file, utag, "--",
+                                     "--no-color", "--no-patch", check=False)
+                    if proc.returncode == 0:
+                        range_diff = proc.stdout
+                    else:
+                        warning(f"{entry.id}: umpf range-diff failed: {proc.stderr.strip()}")
+            if sha256:
+                recipe = os.path.join(worktree, entry.recipe)
+                with open(recipe) as f:
+                    text = f.read()
+                with open(recipe, "w") as f:
+                    f.write(update_checksum(text, entry.checksum_name, sha256, entry.recipe))
+
+            wt = Git(worktree, self.ctx.git_env)
+            wt("add", "-A", "--", entry.patch_dir,
+               *[p for p in (entry.recipe, entry.defconfig) if p])
+            if wt.ok("diff", "--cached", "--quiet"):
+                raise Error(f"updating to {base} changed nothing in the BSP")
+            staged = Staged(commit="", old=old, base=base, utag=utag, conflict=conflict,
+                            kconfig_diff=kconfig_diff, range_diff=range_diff, push_tags=[])
+            commit_args = ["commit", "-q", "--no-verify", "-F", "-"]
+            if entry.signoff:
+                commit_args.append("--signoff")
+            wt(*commit_args, input=self.commit_message(staged))
+            staged.commit = wt("rev-parse", "HEAD")
+        finally:
+            bsp("worktree", "remove", "--force", worktree)
+
+        tags = [old.base, base]
+        if utag:
+            tags = [utag, f"{utag}-flat"] + tags
+        staged.push_tags = repo.missing_remote_tags(tags)
+        return staged
+
+    def olddefconfig(self, repo: UmpfRepo, utag: str, defconfig: str) -> str:
+        entry = self.entry
+        repo.git("checkout", "-q", "-f", "--detach", utag)
+        repo.git("clean", "-q", "-f", "-d", "-x")
+        setup = env = None
+        if entry.sdk:
+            setup = self.ctx.sdk_environment_setup(entry.sdk)
+            env = entry.sdk.env
+        with tempfile.TemporaryDirectory(dir=self.ctx.work_dir) as build:
+            shutil.copyfile(defconfig, os.path.join(build, ".config"))
+            targets = ["olddefconfig"] + (["savedefconfig"] if entry.savedefconfig else [])
+            for target in targets:
+                cmd = ["env", *[f"{k}={v}" for k, v in (env or {}).items()],
+                       "make", "-s", "-C", repo.path, f"O={build}", *entry.make_args, target]
+                if setup:
+                    cmd = ["bash", "-c", '. "$0" > /dev/null && exec "$@"', setup, *cmd]
+                info(f"{entry.id}: make {target}...")
+                run(cmd, env=os.environ.copy())
+            result = os.path.join(build, "defconfig" if entry.savedefconfig else ".config")
+            with open(defconfig) as f:
+                old = f.read()
+            with open(result) as f:
+                new = f.read()
+            diff = ""
+            if old != new:
+                diffconfig = os.path.join(repo.path, "scripts", "diffconfig")
+                proc = None
+                if os.path.exists(diffconfig):
+                    proc = run([sys.executable, diffconfig, defconfig, result], check=False)
+                if proc and proc.returncode == 0:
+                    diff = proc.stdout
+                else:
+                    diff = "".join(difflib.unified_diff(
+                        old.splitlines(True), new.splitlines(True), "a/defconfig", "b/defconfig"))
+            shutil.copyfile(result, defconfig)
+        return diff
+
+    ### texts ###
+
+    def compare_url(self, old: str, new: str) -> str | None:
+        template = self.entry.compare_url
+        if not template:
+            web = web_url(self.entry.repository)
+            if not web:
+                return None
+            template = web + "/compare/{old}..{new}"
+        return template.format(old=old, new=new)
+
+    def changelog_urls(self, old: str, new: str) -> list[str]:
+        if not self.entry.changelog_url:
+            return []
+        try:
+            tags = self.stable_tags(new)
+        except Error:
+            return []
+        return [format_url(self.entry.changelog_url, t, self.strip_prefix(t), self.entry.id)
+                for t in tags if self.newer(t, old) and not self.newer(t, new)]
+
+    def subject(self, base: str) -> str:
+        return f"{self.entry.commit_prefix}update to {base}"
+
+    def review_commands(self, staged: Staged) -> tuple[list[str], str | None, str]:
+        """commands to fetch both umpfs, and to view the range-diff with umpf
+        (if umpfabot's umpf has range-diff) or with plain git"""
+        old = staged.old
+        fetch = [f"git fetch {self.entry.repository} \\",
+                 f"  tag {old.base} tag {old.version} tag {staged.base} tag {staged.utag}"]
+        with_umpf = None
+        if self.ctx.umpf_range_diff:
+            with_umpf = f"umpf range-diff {old.version} {staged.utag}"
+        return (fetch, with_umpf,
+                f"git range-diff {old.base}..'{old.version}^' {staged.base}..'{staged.utag}^'")
+
+    def updated_vars(self) -> str:
+        if self.entry.tarball_url:
+            return "UMPF_BASE and the SRC_URI checksum are"
+        return "UMPF_BASE is"
+
+    def conflict_text(self, staged: Staged) -> str:
+        c = staged.conflict
+        text = f"Conflict while rebasing topic {c.topic or '(unknown)'}"
+        if c.commit:
+            text += f" at\n  {c.commit}"
+        if c.files:
+            text += "\nin\n" + "".join(f"  {f}\n" for f in c.files)
+        return text.rstrip()
+
+    def make_targets(self) -> str:
+        return "olddefconfig" + (" savedefconfig" if self.entry.savedefconfig else "")
+
+    def commit_message(self, staged: Staged) -> str:
+        old = staged.old
+        lines = [self.subject(staged.base), ""]
+        if staged.conflict:
+            lines += [
+                textwrap.fill(f"The {old.name} umpf does not apply on top of "
+                              f"{staged.base}. As a starting point for resolving this, "
+                              f"only {self.updated_vars()} updated, so applying the patch "
+                              "stack fails.", 72),
+                "",
+                self.conflict_text(staged),
+            ]
+        else:
+            text = f"Rebase the {old.name} umpf from {old.base} onto {staged.base}"
+            if self.entry.defconfig:
+                text += (f" and update {os.path.basename(self.entry.defconfig)} with "
+                         f"make {self.make_targets()}")
+            lines += [textwrap.fill(text + ".", 72)]
+            lines += ["", f"Old umpf: {old.version}", f"New umpf: {staged.utag}"]
+            url = self.compare_url(old.version, staged.utag)
+            if url:
+                lines += ["", "Diff between the old and the new umpf:", f"  {url}"]
+            fetch, with_umpf, plain = self.review_commands(staged)
+            lines += ["", "To review the changes to the patch stack:", ""]
+            lines += [f"  {line}" for line in fetch]
+            if with_umpf:
+                lines += [f"  {with_umpf}", "", "or, without umpf:", ""]
+            lines += [f"  {plain}"]
+        return "\n".join(lines) + "\n"
+
+    def metadata(self, staged: Staged, head: str) -> str:
+        meta = {"feature": FEATURE, "id": self.entry.id, "head": head,
+                "from": {"umpf": staged.old.version, "base": staged.old.base},
+                "to": {"umpf": staged.utag, "base": staged.base},
+                "conflict": staged.conflict is not None}
+        return f"<!-- umpfabot-metadata: {json.dumps(meta, sort_keys=True)} -->"
+
+    def pr_body(self, staged: Staged, head: str, parent: str) -> str:
+        entry = self.entry
+        old = staged.old
+        out = [self.metadata(staged, head), ""]
+        out += [f"Updates the **{old.name}** umpf of `{entry.id}` from {old.base} to "
+                f"**{staged.base}**.", ""]
+        if parent in self.stacked_on:
+            lower = self.stacked_on[parent]
+            out += [f"> [!NOTE]\n> This pull request is stacked on #{lower.number} "
+                    f"({lower.target(entry.branch_prefix)}), merge that one first.", ""]
+        out += ["| | umpf | base |", "|---|---|---|",
+                f"| old | `{old.version}` | {old.base} |",
+                f"| new | {'`' + staged.utag + '`' if staged.utag else '(conflict)'} | "
+                f"{staged.base} |", ""]
+        url = staged.utag and self.compare_url(old.version, staged.utag)
+        if url:
+            out += [f"[Diff between the old and the new umpf]({url})", ""]
+        changelogs = self.changelog_urls(old.base, staged.base)
+        if changelogs:
+            out += ["Upstream changes: " + ", ".join(
+                f"[{os.path.basename(u)}]({u})" for u in changelogs), ""]
+
+        if staged.conflict:
+            out += self.conflict_help(staged)
+        else:
+            if staged.range_diff:
+                out += ["### Patch stack", "",
+                        "<details><summary>umpf range-diff</summary>", "", "```",
+                        truncate(staged.range_diff.rstrip()), "```", "", "</details>", ""]
+            if entry.defconfig:
+                out += ["### Kernel configuration", ""]
+                if staged.kconfig_diff:
+                    out += [f"`make {self.make_targets()}` changed `{entry.defconfig}`:", "",
+                            "<details><summary>diffconfig</summary>", "", "```",
+                            truncate(staged.kconfig_diff.rstrip()), "```", "",
+                            "</details>", ""]
+                else:
+                    out += [f"`make {self.make_targets()}` did not change "
+                            f"`{entry.defconfig}`.", ""]
+            fetch, with_umpf, plain = self.review_commands(staged)
+            out += ["### Reviewing", "", "To review the changes to the patch stack:", "",
+                    "```sh", *fetch]
+            if with_umpf:
+                out += [with_umpf, "# or, without umpf:"]
+            out += [plain, "```", ""]
+
+        out += ["---", "<sub>Created by umpfabot stable-update. Pushing to this branch is "
+                "fine: umpfabot will then leave this pull request alone and stop "
+                "updating it.</sub>"]
+        return "\n".join(out) + "\n"
+
+    def conflict_help(self, staged: Staged) -> list[str]:
+        entry = self.entry
+        c = staged.conflict
+        topic = c.topic or "<topic>"
+        branch = entry.branch(staged.base)
+        lines = ["### Conflict", "",
+                 f"The patch stack does not apply on top of {staged.base}. Only "
+                 f"{self.updated_vars().replace('UMPF_BASE', '`UMPF_BASE`')} updated "
+                 "here, so the build is expected to fail in `do_patch`.",
+                 "", "```", self.conflict_text(staged), "```", "",
+                 "<details><summary>umpf output</summary>", "", "```",
+                 truncate(c.log.strip(), 10000), "```", "", "</details>", "",
+                 "### Resolving", "",
+                 "1. Check out this pull request in the BSP (`<bsp>` below):", "",
+                 "   ```sh", f"   git fetch origin && git checkout {branch}", "   ```", "",
+                 f"2. In the umpf repository, update the topic branch `{topic}` so it "
+                 f"applies on {staged.base}, e.g. by rebasing it or by adding a fix, and "
+                 "create a new umpf with it:", "",
+                 "   ```sh",
+                 f"   git fetch {entry.repository} --tags",
+                 f"   git checkout -b {topic} {self.hashinfo(staged.old, c.topic)}",
+                 f"   git rebase {staged.base}    # or fix it in some other way",
+                 f"   umpf --identical --override={topic}={topic} --base={staged.base} \\",
+                 f"       tag <bsp>/{entry.series}",
+                 f"   umpf format-patch --bb --update --patchdir=<bsp>/{entry.patch_dir}",
+                 "   utag=\"$(git describe --exact-match)\"",
+                 f"   git push {entry.repository} \"$utag\" \"$utag-flat\"",
+                 "   ```", ""]
+        if entry.defconfig:
+            sdk_env = " ".join(f"{k}={shlex.quote(v)}" for k, v in
+                               (entry.sdk.env if entry.sdk else {}).items())
+            result = "defconfig" if entry.savedefconfig else ".config"
+            lines += ["3. Update the kernel configuration"
+                      + (" in the SDK environment" if entry.sdk else "") + ":", "",
+                      "   ```sh", "   mkdir -p <build>",
+                      f"   cp <bsp>/{entry.defconfig} <build>/.config",
+                      f"   make {sdk_env + ' ' if sdk_env else ''}O=<build> "
+                      f"{self.make_targets()}",
+                      f"   cp <build>/{result} <bsp>/{entry.defconfig}", "   ```", ""]
+        changed = " ".join(p for p in (entry.patch_dir, entry.defconfig) if p)
+        lines += [f"{4 if entry.defconfig else 3}. Amend the commit of this pull request, "
+                  "force-push it and mark the pull request as ready for review:", "",
+                  "   ```sh", f"   git add -A {changed}", "   git commit --amend",
+                  f"   git push --force origin HEAD:{branch}", "   ```", "",
+                  "Once the pull request is merged, the topic branches are updated from "
+                  "the new umpf as usual. Newer stable updates are only stacked on top of "
+                  "this pull request once it is ready for review.", ""]
+        return lines
+
+    @staticmethod
+    def hashinfo(series: Series, topic: str | None) -> str:
+        if topic:
+            m = re.search(rf"^# umpf-(?:squash-)?topic: {re.escape(topic)}\n"
+                          r"# umpf-hashinfo: (\S+)", series.text, re.M)
+            if m:
+                return m.group(1)
+        return "<hashinfo>"
+
+    ### publishing ###
+
+    def publish(self, staged: Staged, branch: str, expected: str | None) -> str:
+        """push the umpf tags, then the BSP branch; returns the published commit
+
+        expected is the commit the branch must currently point to, None if it
+        must not exist."""
+        repo = self.ctx.umpf_repo(self.entry.repository)
+        if self.ctx.dry_run:
+            info(f"dry-run: would push {', '.join(staged.push_tags) or 'no tags'} to "
+                 f"{self.entry.repository} and {staged.commit[:12]} to {branch}")
+        else:
+            if staged.push_tags:
+                repo.git("push", "-q", "--atomic", "origin",
+                         *[f"refs/tags/{t}:refs/tags/{t}" for t in staged.push_tags])
+            # don't overwrite what a developer may have pushed in the meantime
+            self.ctx.bsp("push", "-q", f"--force-with-lease=refs/heads/{branch}:{expected or ''}",
+                         self.ctx.bsp_remote, f"{staged.commit}:refs/heads/{branch}")
+            self.ctx.bsp("update-ref", f"refs/remotes/{self.ctx.bsp_remote}/{branch}",
+                         staged.commit)
+        self.ctx.tips[branch] = staged.commit
+        return staged.commit
+
+    def delete_branch(self, pr: PullRequest) -> None:
+        if self.ctx.dry_run:
+            info(f"dry-run: would delete {pr.head}")
+            return
+        self.ctx.bsp("push", "-q", f"--force-with-lease=refs/heads/{pr.head}:{pr.head_sha}",
+                     self.ctx.bsp_remote, f":refs/heads/{pr.head}", check=False)
+
+    ### pull request handling ###
+
+    def target_of(self, pr: PullRequest) -> str:
+        return pr.target(self.entry.branch_prefix)
+
+    def open_pr(self, staged: Staged, parent: str) -> PullRequest | None:
+        entry = self.entry
+        branch = entry.branch(staged.base)
+        expected = self.ctx.bsp_heads().get(branch)
+        head = self.publish(staged, branch, expected)
+        pr = self.ctx.forge.create_pull(branch, parent, self.subject(staged.base),
+                                        self.pr_body(staged, head, parent),
+                                        draft=staged.conflict is not None)
+        self.ctx.forge.decorate(pr, entry.labels, entry.reviewers, entry.assignees)
+        notice(f"{entry.id}: opened {'draft ' if staged.conflict else ''}pull request "
+               f"#{pr.number} for {staged.base} ({pr.url})")
+        self.prs.append(pr)
+        return pr
+
+    def refresh(self, pr: PullRequest, reason: str) -> None:
+        """regenerate an unedited pull request on top of its (changed) base"""
+        meta = pr.meta
+        parent_series = Series(self.ctx.bsp.show(self.ctx.tip(pr.base), self.entry.series),
+                               self.entry.series)
+        reuse = meta["to"]["umpf"] if parent_series.version == meta["from"]["umpf"] else None
+        staged = self.stage(self.ctx.tip(pr.base), self.target_of(pr), reuse)
+        head = self.publish(staged, pr.head, pr.head_sha)
+        body = self.pr_body(staged, head, pr.base)
+        self.ctx.forge.update_pull(pr, title=self.subject(staged.base), body=body)
+        conflict = staged.conflict is not None
+        if meta.get("conflict", False) != conflict and pr.draft != conflict:
+            self.ctx.forge.set_draft(pr, conflict)
+            pr.draft = conflict
+        pr.head_sha = head
+        pr.body = body
+        self.ctx.forge.comment(pr, f"Recreated on top of `{pr.base}`: {reason}.")
+        notice(f"{self.entry.id}: recreated #{pr.number} ({reason})")
+
+    def close(self, pr: PullRequest, comment: str) -> None:
+        # deleting the base branch of a pull request closes it
+        for other in self.prs:
+            if other.base == pr.head:
+                self.ctx.forge.update_pull(other, base=pr.base)
+                notice(f"{self.entry.id}: changed base of #{other.number} from "
+                       f"{other.base} to {pr.base}")
+                other.base = pr.base
+        self.ctx.forge.comment(pr, comment)
+        self.ctx.forge.update_pull(pr, state="closed")
+        self.delete_branch(pr)
+        self.prs.remove(pr)
+
+    def ordered(self) -> list[PullRequest]:
+        return sorted(self.prs, key=lambda pr: version_key(
+            self.strip_prefix(self.target_of(pr)) or self.target_of(pr)))
+
+    @property
+    def stacked_on(self) -> dict[str, PullRequest]:
+        return {pr.head: pr for pr in self.prs}
+
+    def run(self, version: str | None, force: bool) -> None:
+        ctx = self.ctx
+        entry = self.entry
+        target = entry.target_branch or ctx.forge.default_branch()
+        self.prs = ctx.forge.pulls(entry.branch_prefix)
+        main = Series(ctx.bsp.show(ctx.tip(target), entry.series) or "", entry.series)
+        info(f"{entry.id}: {target} is at {main.version} ({main.base}), "
+             f"{len(self.prs)} open pull request(s)")
+
+        # a lower pull request of a stack was merged or closed
+        for pr in self.prs:
+            if pr.base.startswith(entry.branch_prefix) and pr.base not in self.stacked_on:
+                ctx.forge.update_pull(pr, base=target)
+                notice(f"{entry.id}: changed base of #{pr.number} from {pr.base} to {target}")
+                pr.base = target
+
+        # main was updated to this version (or later) in some other way
+        for pr in list(self.ordered()):
+            if self.newer(self.target_of(pr), main.base):
+                continue
+            text = (f"{target} is already at {main.base}, so this pull request is "
+                    "no longer needed.")
+            if pr.edited:
+                comment_once(ctx.forge, pr, f"obsolete:{main.base}", text)
+            else:
+                self.close(pr, text)
+                notice(f"{entry.id}: closed #{pr.number}, {target} is at {main.base}")
+
+        newest = self.select(main, version, force)
+
+        top = self.ordered()[-1] if self.prs else None
+        supersede = None
+        create = newest is not None
+        if create and top:
+            # a draft with an unresolved conflict is no base to stack on
+            conflict = top.draft and (top.meta or {}).get("conflict", False)
+            if entry.pending == "supersede" or conflict:
+                if top.edited:
+                    comment_once(ctx.forge, top, f"newer:{newest}",
+                                 f"{newest} is available, but since this pull request "
+                                 "has been edited by someone other than umpfabot, it was "
+                                 "not updated. A pull request for the newer version will "
+                                 "be opened once this one is merged or closed.")
+                    notice(f"{entry.id}: {newest} is available, but #{top.number} was edited")
+                    create = False
+                else:
+                    supersede = top
+            elif len(self.prs) >= entry.open_pull_requests_limit:
+                notice(f"{entry.id}: {newest} is available, but there are already "
+                       f"{len(self.prs)} open pull requests")
+                create = False
+
+        # recreate unedited pull requests whose base changed, from the bottom up
+        for pr in self.ordered():
+            if pr is supersede:
+                continue
+            parent_tip = ctx.tip(pr.base)
+            parent = Series(ctx.bsp.show(parent_tip, entry.series) or "", entry.series)
+            meta = pr.meta or {}
+            if meta.get("from", {}).get("umpf") not in (None, parent.version):
+                reason = f"{pr.base} now has {parent.version}"
+            elif pr.mergeable is False:
+                reason = f"it conflicted with {pr.base}"
+            elif (pr.base.startswith(entry.branch_prefix) and
+                  not ctx.bsp.ok("merge-base", "--is-ancestor", parent_tip, pr.head_sha)):
+                # main moving on is fine, but stacked ones must follow their base
+                reason = f"{pr.base} was updated"
+            else:
+                continue
+            if pr.edited:
+                comment_once(ctx.forge, pr, f"stale:{reason}",
+                             f"This pull request is out of date ({reason}), but since it "
+                             "has been edited by someone other than umpfabot, it was not "
+                             "recreated.")
+                notice(f"{entry.id}: #{pr.number} is out of date, but was edited")
+            else:
+                self.refresh(pr, reason)
+
+        if not create:
+            return
+        parent = target
+        if supersede:
+            parent = supersede.base
+        elif top:
+            parent = top.head
+        staged = self.stage(ctx.tip(parent), newest)
+        pr = self.open_pr(staged, parent)
+        if supersede:
+            self.close(supersede, f"Superseded by #{pr.number}.")
+            notice(f"{entry.id}: closed #{supersede.number}, superseded by #{pr.number}")
+        elif top:
+            comment_once(ctx.forge, top, f"stacked:{newest}",
+                         f"{newest} is available, #{pr.number} is stacked on top of this "
+                         "pull request.")
+
+    def select(self, main: Series, version: str | None, force: bool) -> str | None:
+        """the stable release to open a new pull request for, if any"""
+        entry = self.entry
+        tags = self.stable_tags(main.base)
+        current = max([main.base] + [self.target_of(pr) for pr in self.prs],
+                      key=lambda t: version_key(self.strip_prefix(t) or t))
+        if version:
+            if version not in tags:
+                raise Error(f"{entry.id}: {version} is not a stable release of {main.base}")
+            if not self.newer(version, current):
+                notice(f"{entry.id}: {version} is not newer than {current}")
+                return None
+            newest = version
+        else:
+            if not tags or not self.newer(tags[-1], current):
+                info(f"{entry.id}: {current} is up to date")
+                return None
+            newest = tags[-1]
+        closed = [pr for pr in self.ctx.forge.closed_pulls(entry.branch(newest))
+                  if not pr.merged]
+        if closed and not force:
+            notice(f"{entry.id}: skipping {newest}, #{closed[-1].number} was closed "
+                   "without merging")
+            return None
+        if entry.tarball_url:
+            url = format_url(entry.tarball_url, newest, self.strip_prefix(newest), entry.id)
+            if self.ctx.sha256(url) is None:
+                notice(f"{entry.id}: {newest} is released, but {url} is not available yet")
+                return None
+        return newest
+
+
+def cmd_stable_update(ctx: Context, args) -> int:
+    entries = ctx.entries
+    if args.id:
+        entries = [e for e in entries if e.id == args.id]
+        if not entries:
+            raise Error(f"no {FEATURE} entry with id '{args.id}'")
+    if args.version and len(entries) != 1:
+        raise Error("--version requires --id")
+    if not entries:
+        info(f"no {FEATURE} entries configured")
+        return 0
+
+    ctx.bsp("worktree", "prune")
+    info(f"fetching {ctx.bsp_remote}...")
+    ctx.bsp("fetch", "-q", "--prune", ctx.bsp_remote,
+            f"+refs/heads/*:refs/remotes/{ctx.bsp_remote}/*")
+    failed = 0
+    for entry in entries:
+        try:
+            StableUpdate(ctx, entry).run(args.version, args.force)
+        except Error as e:
+            failed += 1
+            msg = f"{entry.id}: {e}"
+            if github_actions():
+                print(f"::error::{msg.splitlines()[0]}", flush=True)
+            info(msg)
+            SUMMARY.append(f"error: {msg.splitlines()[0]}")
+    return 1 if failed else 0
+
+
+def write_summary() -> None:
+    path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if not path or not SUMMARY:
+        return
+    with open(path, "a") as f:
+        f.write("## umpfabot\n\n" + "".join(f"- {line}\n" for line in SUMMARY))
+
+
+def main() -> int:
+    global VERBOSE
+    parser = argparse.ArgumentParser(
+        prog="umpfabot", description="keep umpfs in BSP repositories up to date")
+    parser.add_argument("-C", "--bsp-dir", default=".",
+                        help="checkout of the BSP repository (default: .)")
+    parser.add_argument("--bsp-remote", default="origin",
+                        help="remote of the BSP repository (default: origin)")
+    parser.add_argument("-c", "--config", help=f"configuration (default: <bsp>/{DEFAULT_CONFIG})")
+    parser.add_argument("-w", "--work-dir",
+                        default=os.path.join(os.environ.get("XDG_CACHE_HOME") or
+                                             os.path.expanduser("~/.cache"), "umpfabot"),
+                        help="directory for clones, SDKs and downloads; worth caching")
+    parser.add_argument("--repo", help="GitHub repository of the BSP as owner/name "
+                        "(default: $GITHUB_REPOSITORY or derived from the remote)")
+    parser.add_argument("--token", help="GitHub token (default: $UMPFABOT_TOKEN, "
+                        "$GH_TOKEN or $GITHUB_TOKEN)")
+    parser.add_argument("--umpf", metavar="PATH",
+                        help="use this umpf executable instead of the configured version")
+    parser.add_argument("-n", "--dry-run", action="store_true",
+                        help="stage everything, but neither push nor modify pull requests")
+    parser.add_argument("--forge-state", metavar="FILE", help=argparse.SUPPRESS)
+    parser.add_argument("-v", "--verbose", action="store_true")
+    sub = parser.add_subparsers(dest="command", required=True, metavar="<command>")
+
+    p = sub.add_parser(FEATURE, help="update umpfs to the newest upstream stable release")
+    p.add_argument("--id", help="only handle the entry with this id")
+    p.add_argument("--version", help="update to this release instead of the newest one "
+                   "(requires --id)")
+    p.add_argument("--force", action="store_true",
+                   help="update even if a pull request for the version was closed")
+    # also accepted after the command
+    p.add_argument("-n", "--dry-run", action="store_true", default=argparse.SUPPRESS,
+                   help=argparse.SUPPRESS)
+    p.add_argument("-v", "--verbose", action="store_true", default=argparse.SUPPRESS,
+                   help=argparse.SUPPRESS)
+    p.set_defaults(func=cmd_stable_update)
+
+    args = parser.parse_args()
+    VERBOSE = args.verbose
+    try:
+        ctx = Context(args)
+        return args.func(ctx, args)
+    except Error as e:
+        if github_actions():
+            print(f"::error::{str(e).splitlines()[0]}", flush=True)
+        info(str(e))
+        return 1
+    finally:
+        write_summary()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

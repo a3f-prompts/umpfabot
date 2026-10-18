@@ -1,0 +1,75 @@
+# Example workflow for the BSP repository, to be placed in
+# .github/workflows/umpfabot-stable-update.yml
+name: umpfabot stable-update
+
+on:
+  schedule:
+    # every day at 04:23 UTC
+    - cron: '23 4 * * *'
+  workflow_dispatch:
+    inputs:
+      id:
+        description: 'Only update this entry (default: all)'
+        required: false
+      version:
+        description: 'Update to this release instead of the newest one, e.g. v6.12.53 (requires id)'
+        required: false
+      force:
+        description: 'Update even if a pull request for the release was closed'
+        type: boolean
+        default: false
+      dry-run:
+        description: 'Only show what would be done'
+        type: boolean
+        default: false
+
+# never run two updates at the same time
+concurrency:
+  group: umpfabot-stable-update
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  stable-update:
+    runs-on: ubuntu-latest
+    steps:
+      # A GitHub App token is needed: the GITHUB_TOKEN of this workflow can
+      # neither push the umpf tags to the kernel repository nor trigger CI
+      # for the pull requests it creates.
+      - name: Get a token for the BSP and the kernel repository
+        id: token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.UMPFABOT_APP_ID }}
+          private-key: ${{ secrets.UMPFABOT_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: |
+            ${{ github.event.repository.name }}
+            linux
+
+      - uses: actions/checkout@v5
+        with:
+          token: ${{ steps.token.outputs.token }}
+          fetch-depth: 0
+
+      - name: Compute cache key
+        id: cache-key
+        run: echo "week=$(date +%G-%V)" >> "$GITHUB_OUTPUT"
+
+      # the kernel clone and the SDK take a while to download
+      - name: Cache clones, SDKs and downloads
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/umpfabot
+          key: umpfabot-${{ steps.cache-key.outputs.week }}
+          restore-keys: umpfabot-
+
+      - uses: a3f-prompts/umpfabot@main
+        with:
+          token: ${{ steps.token.outputs.token }}
+          id: ${{ inputs.id }}
+          version: ${{ inputs.version }}
+          force: ${{ inputs.force }}
+          dry-run: ${{ inputs.dry-run }}

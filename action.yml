@@ -1,0 +1,65 @@
+name: umpfabot
+description: Keep the umpfs of a Yocto BSP up to date with pull requests
+inputs:
+  command:
+    description: umpfabot command to run
+    default: stable-update
+  token:
+    description: >-
+      Token with write access to the BSP and to the repositories with the
+      umpf tags, e.g. from actions/create-github-app-token. Pull requests
+      created with the GITHUB_TOKEN of the workflow don't trigger CI.
+    required: true
+  bsp-dir:
+    description: Checkout of the BSP repository
+    default: .
+  config:
+    description: 'Configuration file (default: <bsp-dir>/.github/umpfabot.yml)'
+    default: ''
+  work-dir:
+    description: >-
+      Directory for clones, SDKs and downloads, worth caching between runs
+      (default: ~/.cache/umpfabot)
+    default: ''
+  id:
+    description: Only handle the entry with this id
+    default: ''
+  version:
+    description: Update to this release instead of the newest one (requires id)
+    default: ''
+  force:
+    description: Update even if a pull request for the release was closed
+    default: 'false'
+  dry-run:
+    description: Stage everything, but neither push nor modify pull requests
+    default: 'false'
+runs:
+  using: composite
+  steps:
+    - name: Install dependencies
+      shell: bash
+      run: |
+        python3 -c 'import yaml' 2>/dev/null ||
+        { sudo apt-get update -qq && sudo apt-get install -y -qq python3-yaml; }
+    - name: Run umpfabot
+      shell: bash
+      env:
+        UMPFABOT_TOKEN: ${{ inputs.token }}
+        INPUT_COMMAND: ${{ inputs.command }}
+        INPUT_BSP_DIR: ${{ inputs.bsp-dir }}
+        INPUT_CONFIG: ${{ inputs.config }}
+        INPUT_WORK_DIR: ${{ inputs.work-dir }}
+        INPUT_ID: ${{ inputs.id }}
+        INPUT_VERSION: ${{ inputs.version }}
+        INPUT_FORCE: ${{ inputs.force }}
+        INPUT_DRY_RUN: ${{ inputs.dry-run }}
+      run: |
+        args=(-C "${INPUT_BSP_DIR}")
+        if [ -n "${INPUT_CONFIG}" ]; then args+=(-c "${INPUT_CONFIG}"); fi
+        if [ -n "${INPUT_WORK_DIR}" ]; then args+=(-w "${INPUT_WORK_DIR}"); fi
+        if [ "${INPUT_DRY_RUN}" = true ]; then args+=(--dry-run); fi
+        args+=("${INPUT_COMMAND}")
+        if [ -n "${INPUT_ID}" ]; then args+=(--id "${INPUT_ID}"); fi
+        if [ -n "${INPUT_VERSION}" ]; then args+=(--version "${INPUT_VERSION}"); fi
+        if [ "${INPUT_FORCE}" = true ]; then args+=(--force); fi
+        exec "${GITHUB_ACTION_PATH}/umpfabot" "${args[@]}"

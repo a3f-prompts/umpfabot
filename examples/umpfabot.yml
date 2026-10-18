@@ -1,0 +1,49 @@
+# Example umpfabot configuration, to be placed in the BSP repository as
+# .github/umpfabot.yml. See the umpfabot README.rst for all options.
+version: 1
+
+# identity for the BSP commits and umpf tags created by umpfabot
+author: "acme-umpfabot[bot] <123456+acme-umpfabot[bot]@users.noreply.github.com>"
+
+# the umpf used for tagging, by default the newest one with the patches of
+# umpfabot that are not upstream yet
+#umpf:
+#  repository: https://github.com/pengutronix/umpf.git
+#  version: "<branch, tag or commit>"
+
+stable-update:
+  - id: linux-acme
+    # written by 'umpf format-patch --bb', the patches are next to it
+    series: recipes-kernel/linux/linux-acme/patches/series.inc
+    # the recipe with the SRC_URI checksum of the base tarball
+    recipe: recipes-kernel/linux/linux-acme_6.12.bb
+    # where the umpf tags and topic branches live
+    repository: https://github.com/acme/linux.git
+
+    upstream:
+      # where to look for new releases; if unset, the tags of 'repository'
+      # are used, e.g. if they are mirrored there by another workflow
+      repository: https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git
+      # releases with the same first two version components as the current
+      # umpf-base are stable updates, like STABLE_VERSION_PARTS in oe-core
+      stable-version-parts: 2
+      changelog-url: "https://cdn.kernel.org/pub/linux/kernel/v{major}.x/ChangeLog-{version}"
+
+    tarball:
+      url: "https://cdn.kernel.org/pub/linux/kernel/v{major}.x/linux-{version}.tar.xz"
+
+    kconfig:
+      defconfig: recipes-kernel/linux/linux-acme/defconfig
+
+    # 'make olddefconfig' runs in this SDK, so the result matches the
+    # compiler that builds the kernel
+    sdk:
+      installer: "https://downloads.acme.example/sdk/acme-glibc-x86_64-acme-image-cortexa53-crypto-toolchain-6.0.sh"
+      sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+      environment-setup: environment-setup-cortexa53-crypto-oe-linux
+      env:
+        ARCH: arm64
+        CROSS_COMPILE: aarch64-oe-linux-
+
+    labels: [kernel]
+    reviewers: [acme/kernel-maintainers]

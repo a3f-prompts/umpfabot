@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Checkout umpf
+      # like umpfabot by default: the newest umpf with the patches that are
+      # not upstream yet
+      run: |
+        repository=$(sed -n 's/^DEFAULT_UMPF_REPOSITORY = "\(.*\)"$/\1/p' umpfabot)
+        git clone -q "${repository}" "${RUNNER_TEMP}/umpf"
+        for patch in patches/*.patch; do
+          git -C "${RUNNER_TEMP}/umpf" apply --check --reverse --include=umpf \
+            "${PWD}/${patch}" 2>/dev/null ||
+            git -C "${RUNNER_TEMP}/umpf" apply --3way --include=umpf "${PWD}/${patch}"
+        done
+        echo "UMPF=${RUNNER_TEMP}/umpf/umpf" >> "${GITHUB_ENV}"
+
+    - name: Setup Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.x'
+
+    - name: Install pytest, PyYAML & pyflakes
+      run: pip install pytest pytest-xdist pyyaml pyflakes
+
+    - name: Run pyflakes
+      run: python -m pyflakes umpfabot tests/*.py
+
+    - name: Run tests
+      run: python -m pytest -v -n auto tests/
