@@ -40,6 +40,9 @@ FEATURE = "stable-update"
 DEFAULT_CONFIG = ".github/umpfabot.yml"
 DEFAULT_AUTHOR = "umpfabot <umpfabot@users.noreply.github.com>"
 DEFAULT_UMPF_REPOSITORY = "https://github.com/pengutronix/umpf.git"
+# for make olddefconfig: Debian with the arm64 cross compiler and what Kbuild needs
+DEFAULT_CONTAINER_IMAGE = "docker.io/tuxmake/arm64_gcc-14"
+DEFAULT_CONTAINER_PREPARE = "${CROSS_COMPILE}gcc --version"
 METADATA_RE = re.compile(r"<!-- umpfabot-metadata: (\{.*?\}) -->")
 # GitHub limits pull request bodies to 65536 characters
 MAX_SECTION = 20000
@@ -177,6 +180,12 @@ class Sdk:
 
 
 @dataclasses.dataclass
+class Container:
+    image: str
+    prepare: str
+
+
+@dataclasses.dataclass
 class Entry:
     """one stable-update entry of the configuration"""
     id: str
@@ -195,6 +204,7 @@ class Entry:
     savedefconfig: bool
     make_args: list[str]
     sdk: Sdk | None
+    container: Container | None
     tag_version: int
     target_branch: str | None
     pending: str
@@ -249,6 +259,25 @@ def parse_entry(d: dict, index: int) -> Entry:
         if sdk.installer and sdk.path:
             raise Error(f"{sdk_where}: 'installer' and 'path' are mutually exclusive")
 
+    # make olddefconfig runs in a container by default, 'container: false' runs it
+    # on the runner
+    container: Container | None = Container(DEFAULT_CONTAINER_IMAGE,
+                                            DEFAULT_CONTAINER_PREPARE)
+    container_d = _get(d, "container", None, {}, where=where)
+    if container_d is False:
+        container = None
+    elif container_d is True:
+        pass
+    elif isinstance(container_d, dict):
+        container_where = f"{where}.container"
+        container = Container(
+            image=_get(container_d, "image", str, DEFAULT_CONTAINER_IMAGE,
+                       where=container_where),
+            prepare=_get(container_d, "prepare", str, DEFAULT_CONTAINER_PREPARE,
+                         where=container_where))
+    else:
+        raise Error(f"{where}: 'container' must be a mapping or false")
+
     pending = _get(d, "pending", str, "stack", where=where)
     if pending not in ("stack", "supersede"):
         raise Error(f"{where}: 'pending' must be 'stack' or 'supersede'")
@@ -279,6 +308,7 @@ def parse_entry(d: dict, index: int) -> Entry:
         make_args=[str(a) for a in _get(kconfig, "make-args", list, [],
                                         where=f"{where}.kconfig")],
         sdk=sdk,
+        container=container,
         tag_version=_get(d, "tag-version", int, 90, where=where),
         target_branch=_get(d, "target-branch", str, where=where),
         pending=pending,
@@ -792,6 +822,14 @@ def umpf_patches() -> list[str]:
     return []
 
 
+def container_engine() -> str:
+    for engine in ("docker", "podman"):
+        if shutil.which(engine):
+            return engine
+    raise Error("make olddefconfig runs in a container, but neither docker nor podman was "
+                "found. Install one or set 'container: false' to run it on the runner.")
+
+
 def parse_author(author: str) -> tuple[str, str]:
     m = re.fullmatch(r"\s*(.*?)\s*<([^>]+)>\s*", author)
     if not m:
@@ -989,7 +1027,8 @@ class Context:
             json.dump(cache, f, indent=2)
         return cache[url]
 
-    def sdk_environment_setup(self, sdk: Sdk) -> str | None:
+    def sdk_environment_setup(self, sdk: Sdk) -> tuple[str, str] | None:
+        """the root of the SDK, installed if needed, and its environment setup script"""
         root = sdk.path
         if sdk.installer:
             key = sdk.sha256 or hashlib.sha256(sdk.installer.encode()).hexdigest()
@@ -1002,7 +1041,7 @@ class Context:
         if len(matches) != 1:
             raise Error(f"expected one '{sdk.environment_setup}' in {root}, "
                         f"found {len(matches)}")
-        return matches[0]
+        return root, matches[0]
 
     def install_sdk(self, sdk: Sdk, root: str) -> None:
         with tempfile.TemporaryDirectory(dir=self.work_dir) as tmp:
@@ -1184,37 +1223,76 @@ class StableUpdate:
         entry = self.entry
         repo.git("checkout", "-q", "-f", "--detach", utag)
         repo.git("clean", "-q", "-f", "-d", "-x")
-        setup = env = None
-        if entry.sdk:
-            setup = self.ctx.sdk_environment_setup(entry.sdk)
-            env = entry.sdk.env
-        with tempfile.TemporaryDirectory(dir=self.ctx.work_dir) as build:
-            shutil.copyfile(defconfig, os.path.join(build, ".config"))
-            target = self.make_target()
-            cmd = ["env", *[f"{k}={v}" for k, v in (env or {}).items()],
-                   "make", "-s", "-C", repo.path, f"O={build}", *entry.make_args, target]
-            if setup:
-                cmd = ["bash", "-c", '. "$0" > /dev/null && exec "$@"', setup, *cmd]
+        sdk = self.ctx.sdk_environment_setup(entry.sdk) if entry.sdk else None
+        script = self.kconfig_script(shlex.quote(sdk[1]) if sdk else None)
+        target = self.make_target()
+        if entry.container:
+            image = entry.container.image
+            engine = container_engine()
+            info(f"{entry.id}: pulling {image}...")
+            run([engine, "pull", "-q", image])
+            # read-only: the defconfig comes in on stdin, the result goes out on stdout,
+            # so the container creates no files owned by root here
+            mounts = [repo.path] + ([sdk[0]] if sdk else [])
+            cmd = [engine, "run", "--rm", "-i", "--security-opt", "label=disable",
+                   *[arg for m in mounts for arg in ("-v", f"{m}:{m}:ro")],
+                   "-w", repo.path, "--entrypoint", "bash", image, "-c", script]
+            info(f"{entry.id}: make {target} in {image}...")
+        else:
+            cmd = ["bash", "-c", script]
             info(f"{entry.id}: make {target}...")
-            run(cmd, env=os.environ.copy())
-            result = os.path.join(build, "defconfig" if entry.savedefconfig else ".config")
-            with open(defconfig) as f:
-                old = f.read()
-            with open(result) as f:
-                new = f.read()
-            diff = None
+        with open(defconfig) as f:
+            old = f.read()
+        proc = run(cmd, cwd=repo.path, input=old)
+        if proc.stderr.strip() and not VERBOSE:
+            # the output of prepare, e.g. the compiler version, and of Kconfig
+            sys.stderr.write(textwrap.indent(proc.stderr.rstrip("\n"), "  ") + "\n")
+        new = proc.stdout
+        diff = None
+        with tempfile.TemporaryDirectory(dir=self.ctx.work_dir) as tmp:
+            result = os.path.join(tmp, os.path.basename(defconfig))
+            with open(result, "w") as f:
+                f.write(new)
             if old != new:
                 diffconfig = os.path.join(repo.path, "scripts", "diffconfig")
-                proc = None
+                diff_proc = None
                 if os.path.exists(diffconfig):
-                    proc = run([sys.executable, diffconfig, defconfig, result], check=False)
-                if proc and proc.returncode == 0:
-                    diff = proc.stdout
+                    diff_proc = run([sys.executable, diffconfig, defconfig, result],
+                                    check=False)
+                if diff_proc and diff_proc.returncode == 0:
+                    diff = diff_proc.stdout
                 else:
                     diff = "".join(difflib.unified_diff(
                         old.splitlines(True), new.splitlines(True), "a/defconfig", "b/defconfig"))
             shutil.copyfile(result, defconfig)
         return diff
+
+    def kconfig_script(self, setup: str | None) -> str:
+        """the bash script that updates the defconfig in the kernel checkout (the current
+        directory) from stdin to stdout, in the container or on the runner. setup is the
+        shell word for the SDK environment setup script"""
+        entry = self.entry
+        lines = ["set -e"]
+        if setup:
+            lines.append(f". {setup} > /dev/null")
+        env = dict(entry.sdk.env if entry.sdk else {})
+        # the variables of make-args as well, e.g. for ${CROSS_COMPILE}gcc in prepare
+        for arg in entry.make_args:
+            name, eq, value = arg.partition("=")
+            if eq and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+                env[name] = value
+        lines += [f"export {k}={shlex.quote(v)}" for k, v in env.items()]
+        if entry.container and entry.container.prepare.strip():
+            # in this shell, so it can install and set up an SDK
+            lines += ["{ :", entry.container.prepare.strip("\n"), "} >&2"]
+        result = "defconfig" if entry.savedefconfig else ".config"
+        lines += ['build="$(mktemp -d)"',
+                  "trap 'rm -rf \"$build\"' EXIT",
+                  'cat > "$build/.config"',
+                  'make -s O="$build" ' + shlex.join([*entry.make_args, self.make_target()])
+                  + " >&2",
+                  f'cat "$build/{result}"']
+        return "\n".join(lines) + "\n"
 
     ### texts ###
 
@@ -1340,6 +1418,8 @@ class StableUpdate:
             if entry.defconfig:
                 out += ["### Kernel configuration", ""]
                 make = f"`make {self.make_target()}`"
+                if entry.container:
+                    make += f" in `{entry.container.image}`"
                 if staged.kconfig_diff:
                     out += [f"{make} changed `{entry.defconfig}`:", "",
                             "<details><summary>diffconfig</summary>", "", "```",
@@ -1394,16 +1474,27 @@ class StableUpdate:
                  f"   git push {entry.repository} \"$utag\" \"$utag-flat\"",
                  "   ```", ""]
         if entry.defconfig:
-            sdk_env = " ".join(f"{k}={shlex.quote(v)}" for k, v in
-                               (entry.sdk.env if entry.sdk else {}).items())
-            result = "defconfig" if entry.savedefconfig else ".config"
-            lines += ["3. Update the kernel configuration"
-                      + (" in the SDK environment" if entry.sdk else "") + ":", "",
-                      "   ```sh", "   mkdir -p <build>",
-                      f"   cp <bsp>/{entry.defconfig} <build>/.config",
-                      f"   make {sdk_env + ' ' if sdk_env else ''}O=<build> "
-                      f"{self.make_target()}",
-                      f"   cp <build>/{result} <bsp>/{entry.defconfig}", "   ```", ""]
+            setup = f"<sdk>/{entry.sdk.environment_setup}" if entry.sdk else None
+            script = self.kconfig_script(setup).rstrip("\n").split("\n")
+            if entry.container:
+                where = f"in the container `{entry.container.image}`"
+                run_script = ['docker run --rm -i --security-opt label=disable \\',
+                              '    -v "$PWD:$PWD:ro" -w "$PWD" \\']
+                if entry.sdk:
+                    run_script += ["    -v <sdk>:<sdk>:ro \\"]
+                run_script += [f"    --entrypoint bash {entry.container.image} \\"]
+            else:
+                where = "on your machine"
+                run_script = ["bash \\"]
+            defconfig = f"<bsp>/{entry.defconfig}"
+            lines += [f"3. Update the kernel configuration {where}, in the kernel checkout "
+                      "at the new umpf:", "", "   ```sh",
+                      *[f"   {line}" for line in run_script],
+                      "     -c \"$(cat <<'KCONFIG'",
+                      *[f"   {line}" for line in script],
+                      "   KCONFIG",
+                      f"   )\" < {defconfig} > {defconfig}.new",
+                      f"   mv {defconfig}.new {defconfig}", "   ```", ""]
         changed = " ".join(p for p in (entry.patch_dir, entry.defconfig) if p)
         lines += [f"{4 if entry.defconfig else 3}. Amend the commit of this pull request, "
                   "force-push it and mark the pull request as ready for review:", "",

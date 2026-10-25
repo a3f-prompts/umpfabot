@@ -48,5 +48,12 @@ stable-update:
         ARCH: arm64
         CROSS_COMPILE: aarch64-oe-linux-
 
+    # the container 'make olddefconfig' runs in, with the SDK mounted. The
+    # default has the arm64 cross compiler of Debian and what Kbuild needs.
+    # 'prepare' runs first, in the same shell, e.g. to install more tools.
+    #container:
+    #  image: docker.io/tuxmake/arm64_gcc-14
+    #  prepare: '${CROSS_COMPILE}gcc --version'
+
     labels: [kernel]
     reviewers: [acme/kernel-maintainers]

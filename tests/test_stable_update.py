@@ -52,6 +52,28 @@ savedefconfig: olddefconfig
 \tgrep -v '^CONFIG_TEST_TOOLCHAIN' $(O)/.config > $(O)/defconfig
 """
 
+# 'docker run ... --entrypoint bash <image> -c <script>' on the host: umpfabot mounts
+# the directories at the same path. Each call is logged as a JSON line.
+FAKE_DOCKER = """\
+#!{python}
+import json, os, sys
+with open(os.environ["UMPFABOT_TEST_DOCKER_LOG"], "a") as log:
+    log.write(json.dumps(sys.argv[1:]) + "\\n")
+if sys.argv[1] == "pull":
+    sys.exit(0)
+args = sys.argv[2:]
+while args[0].startswith("-"):
+    opt = args.pop(0)
+    if opt in ("-v", "-w", "--security-opt", "--entrypoint"):
+        value = args.pop(0)
+        if opt == "-w":
+            os.chdir(value)
+image = args.pop(0)
+os.execvp("bash", ["bash", *args])
+"""
+
+DEFAULT_IMAGE = "docker.io/tuxmake/arm64_gcc-14"
+
 CONFIG = """\
 version: 1
 author: umpfabot test <umpfabot@example.com>
@@ -76,7 +98,7 @@ stable-update:
         CROSS_COMPILE: aarch64-test-
     labels: [kernel]
     pending: {pending}
-"""
+{container}"""
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -90,7 +112,7 @@ def umpf_with_range_diff():
 
 
 class Fixture:
-    def __init__(self, tmp, pending="stack", savedefconfig=False):
+    def __init__(self, tmp, pending="stack", savedefconfig=False, container=""):
         self.tmp = tmp
         self.env = dict(os.environ, HOME=os.path.join(tmp, "home"), TZ="UTC",
                         GIT_CONFIG_NOSYSTEM="1", GIT_AUTHOR_NAME="Dev",
@@ -99,6 +121,12 @@ class Fixture:
         for var in ("GITHUB_ACTIONS", "GITHUB_STEP_SUMMARY", "GIT_DIR", "GIT_WORK_TREE"):
             self.env.pop(var, None)
         os.makedirs(self.env["HOME"])
+        bin_dir = self.path("bin")
+        self.write(bin_dir, "docker", FAKE_DOCKER.format(python=sys.executable))
+        os.chmod(os.path.join(bin_dir, "docker"), 0o755)
+        self.docker_log = self.path("docker.log")
+        self.env["PATH"] = bin_dir + os.pathsep + self.env["PATH"]
+        self.env["UMPFABOT_TEST_DOCKER_LOG"] = self.docker_log
         self.up = self.path("upstream")
         self.linux = self.path("linux.git")
         self.bsp = self.path("bsp.git")
@@ -155,11 +183,14 @@ class Fixture:
         self.write(self.dev, DEFCONFIG, "CONFIG_FOO=y\n")
         self.sdk = self.path("sdk")
         self.write(self.sdk, "environment-setup-test",
-                   "export UMPFABOT_TEST_SDK=sdk-ok\nexport ARCH=wrong\n")
+                   "export UMPFABOT_TEST_SDK=sdk-ok\nexport ARCH=wrong\n"
+                   f"export PATH={self.sdk}/bin:$PATH\n")
+        self.write(self.sdk, "bin/aarch64-test-gcc", "#!/bin/sh\necho 'aarch64-test-gcc 1.0'\n")
+        os.chmod(os.path.join(self.sdk, "bin/aarch64-test-gcc"), 0o755)
         self.write(self.dev, ".github/umpfabot.yml", CONFIG.format(
             series=SERIES, recipe=RECIPE, defconfig=DEFCONFIG, linux=f"file://{self.linux}",
             upstream=self.up, dl=self.dl, sdk=self.sdk, pending=pending,
-            savedefconfig=str(savedefconfig).lower()))
+            savedefconfig=str(savedefconfig).lower(), container=container))
         self.commit(self.dev, "initial BSP")
         self.git("push", "-q", "origin", "main", cwd=self.dev)
 
@@ -169,6 +200,13 @@ class Fixture:
 
     def path(self, name):
         return os.path.join(self.tmp, name)
+
+    def docker_runs(self):
+        if not os.path.exists(self.docker_log):
+            return []
+        with open(self.docker_log) as log:
+            calls = [json.loads(line) for line in log]
+        return [c for c in calls if c[0] == "run"]
 
     def git(self, *args, cwd=None, check=True):
         proc = subprocess.run(["git", *args], cwd=cwd or self.tmp, env=self.env, text=True,
@@ -325,8 +363,13 @@ def savedefconfig():
 
 
 @pytest.fixture
-def f(tmp_path, pending, savedefconfig):
-    return Fixture(str(tmp_path), pending, savedefconfig)
+def container():
+    return ""
+
+
+@pytest.fixture
+def f(tmp_path, pending, savedefconfig, container):
+    return Fixture(str(tmp_path), pending, savedefconfig, container)
 
 
 class TestBasic:
@@ -336,7 +379,7 @@ class TestBasic:
 
     def test_clean_update(self, f):
         f.release("v1.0.1")
-        f.bot()
+        proc = f.bot()
 
         utag = bot_utag()
         tags = f.linux_tags()
@@ -360,6 +403,11 @@ class TestBasic:
         assert f.show(branch, DEFCONFIG) == (
             "CONFIG_FOO=y\nCONFIG_TEST_SUBLEVEL=1\n"
             'CONFIG_TEST_TOOLCHAIN="aarch64-test-gcc arm64 sdk-ok"')
+        # in the default container, with the SDK mounted, after the default prepare
+        [docker_run] = f.docker_runs()
+        assert DEFAULT_IMAGE in docker_run
+        assert f"{f.sdk}:{f.sdk}:ro" in docker_run
+        assert "aarch64-test-gcc 1.0" in proc.stdout
 
         msg = f.git("log", "-1", "--format=%B", branch, cwd=f.bsp)
         assert msg.startswith(f"{ID}: update to v1.0.1\n")
@@ -374,6 +422,7 @@ class TestBasic:
         assert "ChangeLog-1.0.1" in body
         assert "foo: add driver" in body  # range-diff
         assert "CONFIG_TEST_SUBLEVEL" in body  # olddefconfig changes
+        assert f"`make olddefconfig` in `{DEFAULT_IMAGE}` changed" in body
         assert f.meta(1)["head"] == f.git("rev-parse", branch, cwd=f.bsp)
 
         # the instructions in the commit message actually work
@@ -398,7 +447,8 @@ class TestBasic:
         f.write(f.tmp, "sdk.sh",
                 "while [ $# -gt 0 ]; do [ \"$1\" = -d ] && dir=\"$2\"; shift; done\n"
                 "mkdir -p \"$dir\" && echo >> \"$0.count\"\n"
-                "echo 'export UMPFABOT_TEST_SDK=installed' > \"$dir/environment-setup-x\"\n")
+                "echo 'export UMPFABOT_TEST_SDK=installed' > \"$dir/environment-setup-x\"\n"
+                f"echo 'export PATH={f.sdk}/bin:$PATH' >> \"$dir/environment-setup-x\"\n")
         with open(installer, "rb") as inst:
             sha256 = hashlib.sha256(inst.read()).hexdigest()
         config = os.path.join(f.ci, ".github/umpfabot.yml")
@@ -461,6 +511,18 @@ class TestBasic:
         msg = f.git("log", "-1", "--format=%B", branch, cwd=f.bsp)
         assert "Conflict while rebasing topic topic/foo" in msg
         assert f.meta(1)["conflict"]
+
+        # the commands to update the kernel configuration work
+        step = body[body.index("3. Update the kernel configuration in the container"):]
+        commands = step[step.index("```sh\n") + 6:step.index("   ```\n")]
+        commands = "".join(line[3:] for line in commands.splitlines(True))
+        commands = commands.replace("<bsp>", f.dev).replace("<sdk>", f.sdk)
+        f.git("fetch", "-q", "origin", "tag", "v1.0.1", cwd=f.kernel)
+        f.git("checkout", "-q", "--detach", "v1.0.1", cwd=f.kernel)
+        subprocess.run(["bash", "-e", "-c", commands], cwd=f.kernel, env=f.env, check=True)
+        with open(os.path.join(f.dev, DEFCONFIG)) as defconfig:
+            assert "CONFIG_TEST_SUBLEVEL=1\n" in defconfig.read()
+        assert DEFAULT_IMAGE in f.docker_runs()[-1]
 
     def test_dry_run(self, f):
         f.release("v1.0.1")
@@ -762,6 +824,51 @@ class TestSupersede:
         assert [(p["head"], p["base"]) for p in prs] == [(f.branch("v1.0.2"), "main")]
 
 
+class TestContainer:
+    def test_on_the_runner(self, f):
+        with open(os.path.join(f.ci, ".github/umpfabot.yml"), "a") as config:
+            config.write("    container: false\n")
+        f.release("v1.0.1")
+        proc = f.bot()
+        assert f.docker_runs() == []
+        assert "aarch64-test-gcc 1.0" not in proc.stdout  # no prepare
+        assert f.show(f.branch("v1.0.1"), DEFCONFIG) == (
+            "CONFIG_FOO=y\nCONFIG_TEST_SUBLEVEL=1\n"
+            'CONFIG_TEST_TOOLCHAIN="aarch64-test-gcc arm64 sdk-ok"')
+        assert "`make olddefconfig` changed" in f.pr(1)["body"]
+
+    def test_image_and_prepare(self, f):
+        # prepare runs in the same shell as make, so it can set up an SDK
+        with open(os.path.join(f.ci, ".github/umpfabot.yml"), "a") as config:
+            config.write("    container:\n"
+                         "      image: registry.example.com/kernel-builder:1\n"
+                         "      prepare: |\n"
+                         "        echo preparing\n"
+                         "        export UMPFABOT_TEST_SDK=prepared\n")
+        f.release("v1.0.1")
+        proc = f.bot()
+        [docker_run] = f.docker_runs()
+        assert "registry.example.com/kernel-builder:1" in docker_run
+        assert "preparing" in proc.stdout
+        assert 'CONFIG_TEST_TOOLCHAIN="aarch64-test-gcc arm64 prepared"' in \
+            f.show(f.branch("v1.0.1"), DEFCONFIG)
+
+    def test_prepare_fails(self, f):
+        with open(os.path.join(f.ci, ".github/umpfabot.yml"), "a") as config:
+            config.write("    container:\n      prepare: no-such-command\n")
+        f.release("v1.0.1")
+        proc = f.bot(check=False)
+        assert proc.returncode != 0
+        assert "no-such-command" in proc.stdout
+        assert f.open_prs() == []
+
+    def test_invalid(self, f):
+        with open(os.path.join(f.ci, ".github/umpfabot.yml"), "a") as config:
+            config.write("    container: ubuntu\n")
+        proc = f.bot(check=False)
+        assert "'container' must be a mapping or false" in proc.stdout
+
+
 class TestSavedefconfig:
     @pytest.fixture
     def savedefconfig(self):
@@ -771,12 +878,12 @@ class TestSavedefconfig:
         f.release("v1.0.1")
         proc = f.bot()
         # savedefconfig alone, it fills in the defaults like olddefconfig
-        assert "make savedefconfig..." in proc.stdout
-        assert "make olddefconfig..." not in proc.stdout
+        assert f"make savedefconfig in {DEFAULT_IMAGE}..." in proc.stdout
+        assert "make olddefconfig" not in proc.stdout
         assert f.show(f.branch("v1.0.1"), DEFCONFIG) == "CONFIG_FOO=y\nCONFIG_TEST_SUBLEVEL=1"
         assert "make savedefconfig" in f.message("v1.0.1").replace("\n", " ")
         body = f.pr(1)["body"]
-        assert f"`make savedefconfig` changed `{DEFCONFIG}`:" in body
+        assert f"`make savedefconfig` in `{DEFAULT_IMAGE}` changed `{DEFCONFIG}`:" in body
         assert "+CONFIG_TEST_SUBLEVEL=1" in body
 
 

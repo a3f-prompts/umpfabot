@@ -26,8 +26,8 @@ entry it:
      commits recorded in the BSP, so only the base changes,
    - ``umpf format-patch --bb --update`` into the BSP,
    - the ``SRC_URI`` sha256sum of the new base tarball in the recipe,
-   - ``make olddefconfig`` (or ``savedefconfig``) of the defconfig, in the
-     configured SDK,
+   - ``make olddefconfig`` (or ``savedefconfig``) of the defconfig, in a
+     container with the cross compiler,
    - a single commit with all of that,
 
 4. publishes, but only after everything was staged successfully: first the
@@ -240,6 +240,10 @@ Configuration
           ARCH: arm64
           CROSS_COMPILE: aarch64-oe-linux-
 
+      container:                    # where make runs, false: on the runner
+        image: docker.io/tuxmake/arm64_gcc-14
+        prepare: '${CROSS_COMPILE}gcc --version'   # runs first, in the same shell
+
       tag-version: 90
       target-branch: main           # default: the default branch
       pending: stack                # or supersede
@@ -258,15 +262,53 @@ The ``url`` and ``changelog-url`` templates can use ``{version}`` (e.g.
 assigned as ``SRC_URI[sha256sum]``, ``SRC_URI[<name>.sha256sum]`` or with an
 inline ``;sha256sum=`` in the recipe.
 
-``make olddefconfig`` runs as ``make -C <kernel> O=<tmp> olddefconfig`` with
-a copy of the defconfig as ``.config``, and the resulting ``.config``
-replaces the defconfig. With ``savedefconfig: true``, for a minimal
-defconfig, ``make savedefconfig`` runs instead and its ``defconfig``
-replaces the defconfig. It fills in the defaults of new options just like
-``olddefconfig``. A minimal defconfig has no header comment with the version,
-so it often stays the same in a stable update. ``sdk.env`` is applied after
-sourcing the SDK environment, so it can override variables set there.
-Without ``sdk``, the tools of the runner are used.
+``make olddefconfig`` runs as ``make O=<tmp> <make-args> olddefconfig`` in the
+kernel checkout, with a copy of the defconfig as ``.config``, and the
+resulting ``.config`` replaces the defconfig. With ``savedefconfig: true``,
+for a minimal defconfig, ``make savedefconfig`` runs instead and its
+``defconfig`` replaces the defconfig. It fills in the defaults of new options
+just like ``olddefconfig``. A minimal defconfig has no header comment with the
+version, so it often stays the same in a stable update.
+
+Kernel configuration
+--------------------
+
+A full ``.config`` records the compiler, e.g. ``CONFIG_CC_VERSION_TEXT``, and
+the options that depend on it. So ``make olddefconfig`` runs in a container
+with a fixed toolchain, by default ``docker.io/tuxmake/arm64_gcc-14`` of
+`TuxMake <https://tuxmake.org>`_: Debian with the arm64 cross compiler
+``aarch64-linux-gnu-gcc`` and the tools Kbuild needs. TuxMake has images for
+other architectures and compilers as well, e.g. ``tuxmake/arm_gcc-14`` or
+``tuxmake/arm64_clang-19``, and tags them with the date, e.g.
+``tuxmake/arm64_gcc-14:20261001``, to pin the image. The defconfig should be
+created with the same image and ``make-args``, otherwise the first pull
+request also shows the different compiler.
+
+The container runs with docker, or podman if there is no docker. The kernel
+checkout and the SDK are mounted read-only at the same paths, the defconfig
+goes in on stdin and the result comes out on stdout. Before ``make``, the
+container runs:
+
+1. the ``environment-setup`` of the SDK, if configured, and ``sdk.env``, so
+   ``sdk.env`` can override variables set there,
+2. ``export`` of the variables in ``make-args``, e.g. ``CROSS_COMPILE``,
+3. ``container.prepare``, by default ``${CROSS_COMPILE}gcc --version``, which
+   shows the compiler in the log and fails early if it is missing.
+
+``prepare`` is a bash script that runs in the same shell as ``make``, so it
+can install packages or an SDK and source its environment, e.g.::
+
+  container:
+    image: docker.io/library/debian:trixie
+    prepare: |
+      apt-get update -q && apt-get install -qy make gcc bison flex wget xz-utils file
+      wget -q https://downloads.acme.example/sdk/acme-sdk.sh
+      sh acme-sdk.sh -y -d /opt/sdk
+      . /opt/sdk/environment-setup-cortexa53-crypto-oe-linux
+
+Unlike ``sdk``, this installs the SDK on every run. With ``container: false``,
+``make`` runs on the runner, with its tools or the ``sdk``, and without
+``prepare``.
 
 umpf version
 ------------
