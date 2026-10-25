@@ -47,10 +47,11 @@ umpf and the commands to review the changes to the patch stack::
     tag v6.12.50 tag 6.12/acme/20260901-1 tag v6.12.53 tag 6.12/acme/20261017-90
   umpf range-diff 6.12/acme/20260901-1 6.12/acme/20261017-90
 
-The pull request additionally shows the ``umpf range-diff`` summary, the
-changes to the defconfig and links to the upstream changelogs.
+The pull request additionally shows the output of ``umpf range-diff`` with
+the changes to the patches, the changes to the defconfig and links to the
+upstream changelogs.
 If the umpf used by umpfabot has no ``range-diff`` command (see `umpf
-version`_), the summary is left out and only the equivalent ``git
+version`_), the range-diff is left out and only the equivalent ``git
 range-diff`` command is given.
 
 Building and testing the result is left to the CI of the BSP.
@@ -294,6 +295,18 @@ container runs:
 2. ``export`` of the variables in ``make-args``, e.g. ``CROSS_COMPILE``,
 3. ``container.prepare``, by default ``${CROSS_COMPILE}gcc --version``, which
    shows the compiler in the log and fails early if it is missing.
+
+The container rarely is exactly the environment the defconfig was made in,
+e.g. it has another compiler or no Rust toolchain, so ``make olddefconfig``
+changes options that have nothing to do with the update, like disabling
+``CONFIG_RUST``. So umpfabot runs ``make olddefconfig`` with the checked-in
+defconfig twice, for the old and for the new umpf, and applies only the
+differences between the two results to the checked-in defconfig: what the
+old umpf changes already is due to the environment and kept as checked in.
+The pull request lists those options with their value in the container.
+Options the update adds are taken as the container has them, even if they
+depend on the compiler, e.g. ``CONFIG_CC_HAS_*``, and are placed after the
+option before them in the container's result.
 
 ``prepare`` is a bash script that runs in the same shell as ``make``, so it
 can install packages or an SDK and source its environment, e.g.::

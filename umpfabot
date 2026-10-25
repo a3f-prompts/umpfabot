@@ -822,6 +822,113 @@ def umpf_patches() -> list[str]:
     return []
 
 
+CONFIG_LINE_RE = re.compile(r"(CONFIG_[A-Za-z0-9_]+)=.*|# (CONFIG_[A-Za-z0-9_]+) is not set")
+
+
+def config_option(line: str) -> str | None:
+    m = CONFIG_LINE_RE.fullmatch(line)
+    return (m[1] or m[2]) if m else None
+
+
+def config_options(text: str) -> dict[str, str]:
+    """the lines of a .config or defconfig by option, in their order"""
+    return {o: line for line in text.splitlines() if (o := config_option(line))}
+
+
+def config_value(line: str | None) -> str:
+    if line is None:
+        return "-"
+    if line.startswith("#"):
+        return "n"
+    return line.split("=", 1)[1]
+
+
+def keep_environment(checked_in: str, before: str,
+                     after: str) -> tuple[str, list[tuple[str, str, str]]]:
+    """The checked-in configuration with the changes from make olddefconfig for the old
+    umpf (before) to the new umpf (after) applied. What make olddefconfig changes for
+    the old umpf already is due to the environment make runs in, e.g. a different
+    compiler, or no Rust toolchain, so it is kept. Returns the configuration and the
+    kept options: name, checked-in value and value in the environment."""
+    c, b, a = config_options(checked_in), config_options(before), config_options(after)
+    kept = [(o[len("CONFIG_"):], config_value(c.get(o)), config_value(b.get(o)))
+            for o in sorted({*c, *b}) if c.get(o) != b.get(o) and a.get(o) == b.get(o)]
+    update = {o: a.get(o) for o in {*b, *a} if b.get(o) != a.get(o)}
+
+    def header(lines: list[str]) -> int:
+        return next((n for n, line in enumerate(lines)
+                     if not line.startswith("#") or config_option(line)), len(lines))
+
+    # the header with the version of the new umpf
+    after_lines = after.splitlines()
+    lines = checked_in.splitlines()
+    lines = after_lines[:header(after_lines)] + lines[header(lines):]
+    # changed and removed options
+    lines = [update.get(o, line) if (o := config_option(line)) else line for line in lines]
+    lines = [line for line in lines if line is not None]
+    # added options, after what is before them in after, the way Kconfig writes them
+    present = {o for line in lines if (o := config_option(line))}
+    for i, line in enumerate(after_lines):
+        option = config_option(line)
+        if option not in update or update[option] is None or option in present:
+            continue
+        pos = anchor(lines, after_lines, i)
+        lines.insert(pos, line)
+        present.add(option)
+    return normalize_config(lines, after.endswith("\n")), kept
+
+
+def anchor(lines: list[str], source: list[str], i: int) -> int:
+    """where to insert source[i] into lines: after the closest line before it in
+    source that is in lines as well, an option or a menu"""
+    for prev in reversed(source[:i]):
+        if prev in ("", "#"):
+            continue
+        option = config_option(prev)
+        for p, line in enumerate(lines):
+            if option and config_option(line) == option or not option and line == prev:
+                break
+        else:
+            continue
+        if not option and 0 < p < len(lines) - 1 and lines[p - 1] == lines[p + 1] == "#":
+            return p + 2  # into the menu, after its title
+        if prev.startswith("# end of "):
+            # Kconfig writes an empty line between the end of a menu and an option
+            if p + 2 < len(lines) and lines[p + 1] == "" and config_option(lines[p + 2]):
+                return p + 2
+            lines[p + 1:p + 1] = [""]
+            return p + 2
+        return p + 1
+    return next((p for p, line in enumerate(lines) if config_option(line)), len(lines))
+
+
+def normalize_config(lines: list[str], newline: bool) -> str:
+    """the empty lines as Kconfig writes them: only before an option or a menu"""
+    out: list[str] = []
+    for n, line in enumerate(lines):
+        if line == "" and (not out or out[-1] == "" or n + 1 == len(lines)
+                           or not (lines[n + 1] == "#" or config_option(lines[n + 1]))):
+            continue
+        out.append(line)
+    return "\n".join(out) + ("\n" if newline else "")
+
+
+def range_diff_markdown(text: str) -> str:
+    """git range-diff output for a ```diff block on GitHub, which only looks at the
+    first column: without the indentation of the patches, the outer diff markers are
+    there and get colored. The commit pairs get a space instead, so that '-:' of a
+    commit that is only in the new umpf is not shown as removed."""
+    out = []
+    for line in text.splitlines():
+        if line.startswith("    "):
+            out.append(line[4:])
+        elif line.strip():
+            out.append(" " + line)
+        else:
+            out.append("")
+    return "\n".join(out)
+
+
 def container_engine() -> str:
     for engine in ("docker", "podman"):
         if shutil.which(engine):
@@ -1078,6 +1185,9 @@ class Staged:
     kconfig_diff: str | None
     range_diff: str | None
     push_tags: list[str]
+    # options that make olddefconfig changes for the old umpf already: (name,
+    # checked-in value, value in the container)
+    kconfig_kept: list[tuple[str, str, str]] = dataclasses.field(default_factory=list)
 
 
 def truncate(text: str, limit: int = MAX_SECTION) -> str:
@@ -1172,6 +1282,7 @@ class StableUpdate:
         bsp("worktree", "add", "-q", "--detach", worktree, parent)
         try:
             kconfig_diff = range_diff = None
+            kconfig_kept: list[tuple[str, str, str]] = []
             series_path = os.path.join(worktree, entry.series)
             if conflict:
                 with open(series_path, "w") as f:
@@ -1180,11 +1291,11 @@ class StableUpdate:
                 repo.umpf("format-patch", "--bb", "--update",
                           f"--patchdir={os.path.join(worktree, entry.patch_dir)}", utag)
                 if entry.defconfig:
-                    kconfig_diff = self.update_defconfig(repo, utag,
-                                                         os.path.join(worktree, entry.defconfig))
+                    kconfig_diff, kconfig_kept = self.update_defconfig(
+                        repo, old.version, utag, os.path.join(worktree, entry.defconfig))
                 if self.ctx.umpf_range_diff:
-                    proc = repo.umpf("range-diff", series_file, utag, "--",
-                                     "--no-color", "--no-patch", check=False)
+                    proc = repo.umpf("range-diff", series_file, utag, "--", "--no-color",
+                                     check=False)
                     if proc.returncode == 0:
                         range_diff = proc.stdout
                     else:
@@ -1202,7 +1313,8 @@ class StableUpdate:
             if wt.ok("diff", "--cached", "--quiet"):
                 raise Error(f"updating to {base} changed nothing in the BSP")
             staged = Staged(commit="", old=old, base=base, utag=utag, conflict=conflict,
-                            kconfig_diff=kconfig_diff, range_diff=range_diff, push_tags=[])
+                            kconfig_diff=kconfig_diff, range_diff=range_diff, push_tags=[],
+                            kconfig_kept=kconfig_kept)
             commit_args = ["commit", "-q", "--no-verify", "-F", "-"]
             if entry.signoff:
                 commit_args.append("--signoff")
@@ -1217,15 +1329,14 @@ class StableUpdate:
         staged.push_tags = repo.missing_remote_tags(tags)
         return staged
 
-    def update_defconfig(self, repo: UmpfRepo, utag: str, defconfig: str) -> str | None:
-        """the changes to the defconfig as diffconfig output, which is empty if only
-        comments changed, or None if it did not change"""
+    def update_defconfig(self, repo: UmpfRepo, old_utag: str, utag: str,
+                         defconfig: str) -> tuple[str | None, list[tuple[str, str, str]]]:
+        """update the defconfig for utag. Returns the changes as diffconfig output, which
+        is empty if only comments changed, or None if it did not change, and the options
+        kept as checked in, see keep_environment()"""
         entry = self.entry
-        repo.git("checkout", "-q", "-f", "--detach", utag)
-        repo.git("clean", "-q", "-f", "-d", "-x")
         sdk = self.ctx.sdk_environment_setup(entry.sdk) if entry.sdk else None
         script = self.kconfig_script(shlex.quote(sdk[1]) if sdk else None)
-        target = self.make_target()
         if entry.container:
             image = entry.container.image
             engine = container_engine()
@@ -1237,17 +1348,37 @@ class StableUpdate:
             cmd = [engine, "run", "--rm", "-i", "--security-opt", "label=disable",
                    *[arg for m in mounts for arg in ("-v", f"{m}:{m}:ro")],
                    "-w", repo.path, "--entrypoint", "bash", image, "-c", script]
-            info(f"{entry.id}: make {target} in {image}...")
+            where = f" in {image}"
         else:
             cmd = ["bash", "-c", script]
-            info(f"{entry.id}: make {target}...")
+            where = ""
         with open(defconfig) as f:
             old = f.read()
-        proc = run(cmd, cwd=repo.path, input=old)
-        if proc.stderr.strip() and not VERBOSE:
-            # the output of prepare, e.g. the compiler version, and of Kconfig
-            sys.stderr.write(textwrap.indent(proc.stderr.rstrip("\n"), "  ") + "\n")
-        new = proc.stdout
+
+        def make(tag: str) -> str:
+            repo.git("checkout", "-q", "-f", "--detach", tag)
+            repo.git("clean", "-q", "-f", "-d", "-x")
+            info(f"{entry.id}: make {self.make_target()}{where} for {tag}...")
+            proc = run(cmd, cwd=repo.path, input=old)
+            if proc.stderr.strip() and not VERBOSE:
+                # the output of prepare, e.g. the compiler version, and of Kconfig
+                sys.stderr.write(textwrap.indent(proc.stderr.rstrip("\n"), "  ") + "\n")
+            return proc.stdout
+
+        # what make does with the old umpf as well is due to the environment, e.g. a
+        # different compiler or no Rust, and not due to the update
+        kept: list[tuple[str, str, str]] = []
+        if repo.has_tag(old_utag):
+            before = make(old_utag)
+            new, kept = keep_environment(old, before, make(utag))
+            if kept:
+                info(f"{entry.id}: kept {len(kept)} option(s) that make changes for "
+                     f"{old_utag} as well: {', '.join(k[0] for k in kept)}")
+        else:
+            warning(f"{entry.id}: {old_utag} not found, so the options that only differ "
+                    "because of the environment cannot be kept")
+            new = make(utag)
+
         diff = None
         with tempfile.TemporaryDirectory(dir=self.ctx.work_dir) as tmp:
             result = os.path.join(tmp, os.path.basename(defconfig))
@@ -1265,7 +1396,7 @@ class StableUpdate:
                     diff = "".join(difflib.unified_diff(
                         old.splitlines(True), new.splitlines(True), "a/defconfig", "b/defconfig"))
             shutil.copyfile(result, defconfig)
-        return diff
+        return diff, kept
 
     def kconfig_script(self, setup: str | None) -> str:
         """the bash script that updates the defconfig in the kernel checkout (the current
@@ -1413,8 +1544,9 @@ class StableUpdate:
         else:
             if staged.range_diff:
                 out += ["### Patch stack", "",
-                        "<details><summary>umpf range-diff</summary>", "", "```",
-                        truncate(staged.range_diff.rstrip()), "```", "", "</details>", ""]
+                        "<details><summary>umpf range-diff</summary>", "", "```diff",
+                        truncate(range_diff_markdown(staged.range_diff.rstrip())), "```", "",
+                        "</details>", ""]
             if entry.defconfig:
                 out += ["### Kernel configuration", ""]
                 make = f"`make {self.make_target()}`"
@@ -1422,7 +1554,7 @@ class StableUpdate:
                     make += f" in `{entry.container.image}`"
                 if staged.kconfig_diff:
                     out += [f"{make} changed `{entry.defconfig}`:", "",
-                            "<details><summary>diffconfig</summary>", "", "```",
+                            "<details><summary>diffconfig</summary>", "", "```diff",
                             truncate(staged.kconfig_diff.rstrip()), "```", "",
                             "</details>", ""]
                 elif staged.kconfig_diff is not None:
@@ -1433,6 +1565,18 @@ class StableUpdate:
                             "changes none of its options, nor the defaults it relies on.", ""]
                 else:
                     out += [f"{make} did not change `{entry.defconfig}`.", ""]
+                if staged.kconfig_kept:
+                    width = max(len(k[0]) for k in staged.kconfig_kept)
+                    out += [f"{len(staged.kconfig_kept)} option(s) are kept as they are: "
+                            f"{make} changes them for {staged.old.version} as well, so it is "
+                            "due to the environment, e.g. a different compiler or a missing "
+                            "Rust toolchain, and not due to the update.", "",
+                            "<details><summary>kept options (checked in -> "
+                            f"{'container' if entry.container else 'runner'})</summary>",
+                            "", "```",
+                            truncate("\n".join(f"{n:{width}} {c} -> {b}"
+                                                for n, c, b in staged.kconfig_kept)),
+                            "```", "", "</details>", ""]
             fetch, with_umpf, plain = self.review_commands(staged)
             out += ["### Reviewing", "", "To review the changes to the patch stack:", "",
                     "```sh", *fetch]
@@ -1494,7 +1638,10 @@ class StableUpdate:
                       *[f"   {line}" for line in script],
                       "   KCONFIG",
                       f"   )\" < {defconfig} > {defconfig}.new",
-                      f"   mv {defconfig}.new {defconfig}", "   ```", ""]
+                      f"   mv {defconfig}.new {defconfig}", "   ```", "",
+                      "   Unlike umpfabot, this doesn't keep the options that `make` changes "
+                      "for the old umpf as well, e.g. because of a different compiler, so "
+                      "check what changed in the defconfig.", ""]
         changed = " ".join(p for p in (entry.patch_dir, entry.defconfig) if p)
         lines += [f"{4 if entry.defconfig else 3}. Amend the commit of this pull request, "
                   "force-push it and mark the pull request as ready for review:", "",

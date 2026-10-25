@@ -11,6 +11,8 @@
 import glob
 import hashlib
 import http.server
+import importlib.machinery
+import importlib.util
 import json
 import os
 import re
@@ -399,14 +401,15 @@ class TestBasic:
         assert f"# umpf-version: {utag}\n" in series
         assert 'UMPF_BASE = "1.0.1"\n' in series
         assert f'SRC_URI[sha256sum] = "{f.sha256("v1.0.1")}"' in f.show(branch, RECIPE)
-        # olddefconfig ran in the SDK environment, with the configured variables
-        assert f.show(branch, DEFCONFIG) == (
-            "CONFIG_FOO=y\nCONFIG_TEST_SUBLEVEL=1\n"
-            'CONFIG_TEST_TOOLCHAIN="aarch64-test-gcc arm64 sdk-ok"')
+        # olddefconfig ran for the old and the new umpf. TEST_TOOLCHAIN only differs
+        # because of the environment, so it stays as it is (not set)
+        assert f.show(branch, DEFCONFIG) == "CONFIG_FOO=y\nCONFIG_TEST_SUBLEVEL=1"
         # in the default container, with the SDK mounted, after the default prepare
-        [docker_run] = f.docker_runs()
-        assert DEFAULT_IMAGE in docker_run
-        assert f"{f.sdk}:{f.sdk}:ro" in docker_run
+        docker_runs = f.docker_runs()
+        assert len(docker_runs) == 2
+        for docker_run in docker_runs:
+            assert DEFAULT_IMAGE in docker_run
+            assert f"{f.sdk}:{f.sdk}:ro" in docker_run
         assert "aarch64-test-gcc 1.0" in proc.stdout
 
         msg = f.git("log", "-1", "--format=%B", branch, cwd=f.bsp)
@@ -423,6 +426,12 @@ class TestBasic:
         assert "foo: add driver" in body  # range-diff
         assert "CONFIG_TEST_SUBLEVEL" in body  # olddefconfig changes
         assert f"`make olddefconfig` in `{DEFAULT_IMAGE}` changed" in body
+        # in the SDK environment, with the configured variables
+        assert ('TEST_TOOLCHAIN - -> "aarch64-test-gcc arm64 sdk-ok"' in body)
+        assert "kept options (checked in -> container)" in body
+        # the range-diff with the patches, the outer diff markers in the first column
+        assert "<summary>umpf range-diff</summary>\n\n```diff\n" in body
+        assert "\n- SUBLEVEL = 0\n+ SUBLEVEL = 1\n" in body
         assert f.meta(1)["head"] == f.git("rev-parse", branch, cwd=f.bsp)
 
         # the instructions in the commit message actually work
@@ -459,10 +468,10 @@ class TestBasic:
             c.write(text)
         f.release("v1.0.1")
         f.bot()
-        assert "aarch64-test-gcc arm64 installed" in f.show(f.branch("v1.0.1"), DEFCONFIG)
+        assert '"aarch64-test-gcc arm64 installed"' in f.pr(1)["body"]
         f.release("v1.0.2")
         f.bot()
-        assert "installed" in f.show(f.branch("v1.0.2"), DEFCONFIG)
+        assert '"aarch64-test-gcc arm64 installed"' in f.pr(2)["body"]
         with open(installer + ".count") as count:
             assert count.read() == "\n"  # installed once
 
@@ -832,10 +841,11 @@ class TestContainer:
         proc = f.bot()
         assert f.docker_runs() == []
         assert "aarch64-test-gcc 1.0" not in proc.stdout  # no prepare
-        assert f.show(f.branch("v1.0.1"), DEFCONFIG) == (
-            "CONFIG_FOO=y\nCONFIG_TEST_SUBLEVEL=1\n"
-            'CONFIG_TEST_TOOLCHAIN="aarch64-test-gcc arm64 sdk-ok"')
-        assert "`make olddefconfig` changed" in f.pr(1)["body"]
+        assert f.show(f.branch("v1.0.1"), DEFCONFIG) == "CONFIG_FOO=y\nCONFIG_TEST_SUBLEVEL=1"
+        body = f.pr(1)["body"]
+        assert "`make olddefconfig` changed" in body
+        assert 'TEST_TOOLCHAIN - -> "aarch64-test-gcc arm64 sdk-ok"' in body
+        assert "kept options (checked in -> runner)" in body
 
     def test_image_and_prepare(self, f):
         # prepare runs in the same shell as make, so it can set up an SDK
@@ -847,11 +857,10 @@ class TestContainer:
                          "        export UMPFABOT_TEST_SDK=prepared\n")
         f.release("v1.0.1")
         proc = f.bot()
-        [docker_run] = f.docker_runs()
-        assert "registry.example.com/kernel-builder:1" in docker_run
+        for docker_run in f.docker_runs():
+            assert "registry.example.com/kernel-builder:1" in docker_run
         assert "preparing" in proc.stdout
-        assert 'CONFIG_TEST_TOOLCHAIN="aarch64-test-gcc arm64 prepared"' in \
-            f.show(f.branch("v1.0.1"), DEFCONFIG)
+        assert '"aarch64-test-gcc arm64 prepared"' in f.pr(1)["body"]
 
     def test_prepare_fails(self, f):
         with open(os.path.join(f.ci, ".github/umpfabot.yml"), "a") as config:
@@ -869,6 +878,173 @@ class TestContainer:
         assert "'container' must be a mapping or false" in proc.stdout
 
 
+class TestKconfig:
+    def test_keeps_environment(self, f):
+        # checked in from another environment: with Rust, which the container lacks,
+        # so olddefconfig drops it, and another compiler
+        f.write(f.dev, DEFCONFIG, "CONFIG_FOO=y\nCONFIG_TEST_RUST=y\nCONFIG_TEST_SUBLEVEL=0\n"
+                'CONFIG_TEST_TOOLCHAIN="other-gcc"\n')
+        f.commit(f.dev, "defconfig from another environment")
+        f.git("push", "-q", "origin", "main", cwd=f.dev)
+        f.release("v1.0.1")
+        f.bot()
+        # only the update is applied
+        assert f.show(f.branch("v1.0.1"), DEFCONFIG) == (
+            "CONFIG_FOO=y\nCONFIG_TEST_RUST=y\nCONFIG_TEST_SUBLEVEL=1\n"
+            'CONFIG_TEST_TOOLCHAIN="other-gcc"')
+        body = f.pr(1)["body"]
+        assert "2 option(s) are kept as they are" in body
+        assert "TEST_RUST      y -> -\n" in body
+        assert 'TEST_TOOLCHAIN "other-gcc" -> "aarch64-test-gcc arm64 sdk-ok"\n' in body
+
+    def test_old_umpf_missing(self, f):
+        f.release("v1.0.1")
+        f.git("push", "-q", f.linux, "--delete", "1.0/acme/20260101-1", cwd=f.kernel)
+        proc = f.bot()
+        assert "1.0/acme/20260101-1 not found" in proc.stdout
+        assert len(f.docker_runs()) == 1
+        assert f.show(f.branch("v1.0.1"), DEFCONFIG) == (
+            "CONFIG_FOO=y\nCONFIG_TEST_SUBLEVEL=1\n"
+            'CONFIG_TEST_TOOLCHAIN="aarch64-test-gcc arm64 sdk-ok"')
+
+
+def load_umpfabot():
+    loader = importlib.machinery.SourceFileLoader("umpfabot", UMPFABOT)
+    spec = importlib.util.spec_from_loader("umpfabot", loader)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["umpfabot"] = module  # for dataclasses
+    loader.exec_module(module)
+    return module
+
+
+def test_keep_environment():
+    keep_environment = load_umpfabot().keep_environment
+    checked_in = """\
+#
+# Linux 1.0
+#
+CONFIG_A=y
+CONFIG_RUST=y
+CONFIG_RUST_X=y
+CONFIG_CC="gcc 16"
+CONFIG_BOTH=1
+# CONFIG_B is not set
+# end of M
+
+#
+# N
+#
+CONFIG_N1=y
+# end of N
+"""
+    # no Rust, another compiler, and something only the environment has
+    before = """\
+#
+# Linux 1.0
+#
+CONFIG_A=y
+# CONFIG_RUST is not set
+CONFIG_CC="gcc 14"
+CONFIG_BOTH=2
+CONFIG_PAHOLE=1
+# CONFIG_B is not set
+# end of M
+
+#
+# N
+#
+CONFIG_N1=y
+# end of N
+"""
+    # the update removes B, changes BOTH, which the environment changes as well, and
+    # adds options after an option, the end of a menu and the title of a menu
+    after = """\
+#
+# Linux 1.1
+#
+CONFIG_A=y
+# CONFIG_RUST is not set
+CONFIG_CC="gcc 14"
+CONFIG_BOTH=3
+CONFIG_NEW=y
+CONFIG_PAHOLE=1
+# end of M
+
+CONFIG_NEW3=y
+
+#
+# N
+#
+CONFIG_NEW2=y
+CONFIG_N1=y
+# end of N
+
+CONFIG_NEW4=y
+"""
+    text, kept = keep_environment(checked_in, before, after)
+    assert text == """\
+#
+# Linux 1.1
+#
+CONFIG_A=y
+CONFIG_RUST=y
+CONFIG_RUST_X=y
+CONFIG_CC="gcc 16"
+CONFIG_BOTH=3
+CONFIG_NEW=y
+# end of M
+
+CONFIG_NEW3=y
+
+#
+# N
+#
+CONFIG_NEW2=y
+CONFIG_N1=y
+# end of N
+
+CONFIG_NEW4=y
+"""
+    assert kept == [("CC", '"gcc 16"', '"gcc 14"'), ("PAHOLE", "-", "1"), ("RUST", "y", "n"),
+                    ("RUST_X", "y", "-")]
+    # the same environment: exactly what make olddefconfig does
+    assert keep_environment(before, before, after) == (after, [])
+    # a minimal defconfig, without a header
+    assert keep_environment("# CONFIG_X is not set\nCONFIG_A=y\nCONFIG_RUST=y\n",
+                            "# CONFIG_X is not set\nCONFIG_A=y\n",
+                            "# CONFIG_X is not set\nCONFIG_A=y\nCONFIG_NEW=y\n") == (
+        "# CONFIG_X is not set\nCONFIG_A=y\nCONFIG_NEW=y\nCONFIG_RUST=y\n",
+        [("RUST", "y", "-")])
+    # removing the only option after the end of a menu removes its empty line as well
+    assert keep_environment("CONFIG_A=y\n# end of M\n\nCONFIG_B=y\n# end of N\n",
+                            "CONFIG_A=y\n# end of M\n\nCONFIG_B=y\n# end of N\n",
+                            "CONFIG_A=y\n# end of M\n# end of N\n") == (
+        "CONFIG_A=y\n# end of M\n# end of N\n", [])
+
+
+def test_range_diff_markdown():
+    range_diff_markdown = load_umpfabot().range_diff_markdown
+    text = ("1:  aaa = 1:  bbb foo\n"
+            "2:  ccc ! 2:  ddd Release 1\n"
+            "    @@ Makefile\n"
+            "    - SUBLEVEL = 0\n"
+            "    + SUBLEVEL = 1\n"
+            "     -EXTRAVERSION =\n"
+            "    -+EXTRAVERSION = -1\n"
+            "\n"
+            "-:  --- > 3:  eee bar\n")
+    assert range_diff_markdown(text) == (
+        " 1:  aaa = 1:  bbb foo\n"
+        " 2:  ccc ! 2:  ddd Release 1\n"
+        "@@ Makefile\n"
+        "- SUBLEVEL = 0\n"
+        "+ SUBLEVEL = 1\n"
+        " -EXTRAVERSION =\n"
+        "-+EXTRAVERSION = -1\n"
+        "\n"
+        " -:  --- > 3:  eee bar")
+
+
 class TestSavedefconfig:
     @pytest.fixture
     def savedefconfig(self):
@@ -878,7 +1054,7 @@ class TestSavedefconfig:
         f.release("v1.0.1")
         proc = f.bot()
         # savedefconfig alone, it fills in the defaults like olddefconfig
-        assert f"make savedefconfig in {DEFAULT_IMAGE}..." in proc.stdout
+        assert f"make savedefconfig in {DEFAULT_IMAGE} for " in proc.stdout
         assert "make olddefconfig" not in proc.stdout
         assert f.show(f.branch("v1.0.1"), DEFCONFIG) == "CONFIG_FOO=y\nCONFIG_TEST_SUBLEVEL=1"
         assert "make savedefconfig" in f.message("v1.0.1").replace("\n", " ")
