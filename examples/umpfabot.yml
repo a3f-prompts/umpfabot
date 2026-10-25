@@ -32,8 +32,11 @@ stable-update:
     tarball:
       url: "https://cdn.kernel.org/pub/linux/kernel/v{major}.x/linux-{version}.tar.xz"
 
+    # the full .config, updated with 'make olddefconfig'
     kconfig:
       defconfig: recipes-kernel/linux/linux-acme/defconfig
+      # for a minimal defconfig: update it with 'make savedefconfig' instead
+      #savedefconfig: true
 
     # 'make olddefconfig' runs in this SDK, so the result matches the
     # compiler that builds the kernel

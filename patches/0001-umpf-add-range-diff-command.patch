@@ -1,4 +1,4 @@
-From ba8dff2c02d09b3c9e7d521ddaf23c46d362ed7c Mon Sep 17 00:00:00 2001
+From 7a25bcf9cde8879b21cb50e26decb1dbf049a4b3 Mon Sep 17 00:00:00 2001
 From: Ahmad Fatoum <ahmad@a3f.at>
 Date: Sun, 18 Oct 2026 22:44:20 +0200
 Subject: [PATCH] umpf: add range-diff command
@@ -12,14 +12,19 @@ Add "umpf range-diff <old> [<new>]", which takes utags or qualified
 useries files (e.g. from format-patch), and passes options after '--'
 on to git range-diff.
 
+The release commits of both umpfs only change the version, but after a
+rebase, their context often differs as well, e.g. SUBLEVEL. With the
+default creation factor of 60, git range-diff shows such a small commit
+as dropped and added instead of changed, so use 100.
+
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
  bash_completion         |  2 +-
- doc/getting-started.rst | 20 +++++++++++++++++
+ doc/getting-started.rst | 26 +++++++++++++++++++++
  tests/meson.build       |  3 ++-
- tests/umpf-range-diff   | 33 ++++++++++++++++++++++++++++
- umpf                    | 48 ++++++++++++++++++++++++++++++++++++++++-
- 5 files changed, 103 insertions(+), 3 deletions(-)
+ tests/umpf-range-diff   | 48 +++++++++++++++++++++++++++++++++++++
+ umpf                    | 52 ++++++++++++++++++++++++++++++++++++++++-
+ 5 files changed, 128 insertions(+), 3 deletions(-)
  create mode 100755 tests/umpf-range-diff
 
 diff --git a/bash_completion b/bash_completion
@@ -36,10 +41,10 @@ index efda5081853e..962a37a318ff 100644
  		refs=( $( compgen -W "$( git for-each-ref --format='%(refname:short)' refs/tags refs/heads refs/remotes)" -- $cur ) )
  		if [ ${#refs[@]} -eq 0 ]; then
 diff --git a/doc/getting-started.rst b/doc/getting-started.rst
-index 35bd388fa9b8..35ef0d1d2b66 100644
+index 35bd388fa9b8..c2c3e86d34c9 100644
 --- a/doc/getting-started.rst
 +++ b/doc/getting-started.rst
-@@ -447,6 +447,26 @@ Or tell umpf to rebase onto a new *umpf-base* when creating a fresh *utag*::
+@@ -447,6 +447,32 @@ Or tell umpf to rebase onto a new *umpf-base* when creating a fresh *utag*::
      # umpf-topic-range: 8bae5bbec8cb4599c141405e9755b7c0e42e064f..19cdc2b857e662a38c712b41ce610000a5ddc6ae
      # umpf-end
  
@@ -63,6 +68,12 @@ index 35bd388fa9b8..35ef0d1d2b66 100644
 +
 +   ~/linux $  umpf range-diff 5.0/special-customer-release/20190311-1 -- --no-patch
 +
++The release commits of both *utags* are tiny, but differ in the version and
++often in the context after a rebase. So that ``git range-diff`` still pairs
++them instead of showing a dropped and an added commit, umpf passes
++``--creation-factor=100``; another ``--creation-factor`` after ``--`` overrides
++it.
++
  Synchronizing umpf topic branch
  -------------------------------
  
@@ -82,10 +93,10 @@ index e9d802fe2d57..f1a29e8c2b61 100644
    test(test_name, run_test, args: test_name, env: test_env)
 diff --git a/tests/umpf-range-diff b/tests/umpf-range-diff
 new file mode 100755
-index 000000000000..3c4b67694a9a
+index 000000000000..bdbf6eac9836
 --- /dev/null
 +++ b/tests/umpf-range-diff
-@@ -0,0 +1,33 @@
+@@ -0,0 +1,48 @@
 +#!/bin/sh
 +#
 +# Test comparing the patch stacks of two umpfs with "umpf range-diff".
@@ -119,8 +130,23 @@ index 000000000000..3c4b67694a9a
 +if umpf range-diff series name/20240314-2; then
 +	exit 1
 +fi
++
++# the release commits are paired, although a new SUBLEVEL in their context
++# makes them differ a lot for their size
++"${TEST_DIR}/prepare-version-branch" "${TEST_DIR}/version-files/src/Makefile" Makefile
++sed -i '/^# umpf-topic: b$/a # umpf-topic: version' series
++export GIT_FALLBACK_REMOTE=refs/heads
++echo | umpf tag --version=4 series --remote=origin
++v4="$(git describe --exact-match HEAD)"
++git checkout -q version
++sed -i 's/^SUBLEVEL = 0$/SUBLEVEL = 1/' Makefile
++git commit -q -a --amend --no-edit
++echo | umpf tag --version=5 series --remote=origin
++umpf range-diff "${v4}" -- --no-color --no-patch > range-diff.out
++test "$(wc -l < range-diff.out)" -eq 4
++grep -q '^4: *[0-9a-f]* ! 4: *[0-9a-f]* Release name/' range-diff.out
 diff --git a/umpf b/umpf
-index fddb73cad02e..5d1fb6e4a528 100755
+index fddb73cad02e..01134dcefbd5 100755
 --- a/umpf
 +++ b/umpf
 @@ -216,6 +216,9 @@ usage() {
@@ -142,7 +168,7 @@ index fddb73cad02e..5d1fb6e4a528 100755
  		abort "Cannot run '$(<${STATE}/command)' without a 'topic-range' for each 'topic'!" \
  			"Maybe you need to 'tag' first?"
  	fi
-@@ -2070,6 +2073,49 @@ do_continue() {
+@@ -2070,6 +2073,53 @@ do_continue() {
  	esac
  }
  
@@ -186,7 +212,11 @@ index fddb73cad02e..5d1fb6e4a528 100755
 +	fi
 +	new="${range}"
 +
-+	${GIT} range-diff "${@}" "${old}" "${new}"
++	# The release commits of two umpfs differ in the version and, after a
++	# rebase, often in the context, e.g. SUBLEVEL. They are so small that
++	# the default creation factor of 60 makes them a rewrite instead of a
++	# pair. Options after '--' come later and take precedence.
++	${GIT} range-diff --creation-factor=100 "${@}" "${old}" "${new}"
 +}
 +
  ### command: abort ###

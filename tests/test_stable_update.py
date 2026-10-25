@@ -47,7 +47,8 @@ olddefconfig:
 \techo 'CONFIG_TEST_SUBLEVEL=$(SUBLEVEL)' >> $(O)/.config
 \techo 'CONFIG_TEST_TOOLCHAIN="$(CROSS_COMPILE)gcc $(ARCH) $(UMPFABOT_TEST_SDK)"' >> $(O)/.config
 
-savedefconfig:
+# like kconfig, which fills in the defaults before writing the minimal configuration
+savedefconfig: olddefconfig
 \tgrep -v '^CONFIG_TEST_TOOLCHAIN' $(O)/.config > $(O)/defconfig
 """
 
@@ -67,6 +68,7 @@ stable-update:
       url: "file://{dl}/linux-{{version}}.tar.gz"
     kconfig:
       defconfig: {defconfig}
+      savedefconfig: {savedefconfig}
     sdk:
       path: {sdk}
       env:
@@ -88,7 +90,7 @@ def umpf_with_range_diff():
 
 
 class Fixture:
-    def __init__(self, tmp, pending="stack"):
+    def __init__(self, tmp, pending="stack", savedefconfig=False):
         self.tmp = tmp
         self.env = dict(os.environ, HOME=os.path.join(tmp, "home"), TZ="UTC",
                         GIT_CONFIG_NOSYSTEM="1", GIT_AUTHOR_NAME="Dev",
@@ -156,7 +158,8 @@ class Fixture:
                    "export UMPFABOT_TEST_SDK=sdk-ok\nexport ARCH=wrong\n")
         self.write(self.dev, ".github/umpfabot.yml", CONFIG.format(
             series=SERIES, recipe=RECIPE, defconfig=DEFCONFIG, linux=f"file://{self.linux}",
-            upstream=self.up, dl=self.dl, sdk=self.sdk, pending=pending))
+            upstream=self.up, dl=self.dl, sdk=self.sdk, pending=pending,
+            savedefconfig=str(savedefconfig).lower()))
         self.commit(self.dev, "initial BSP")
         self.git("push", "-q", "origin", "main", cwd=self.dev)
 
@@ -317,8 +320,13 @@ def pending():
 
 
 @pytest.fixture
-def f(tmp_path, pending):
-    return Fixture(str(tmp_path), pending)
+def savedefconfig():
+    return False
+
+
+@pytest.fixture
+def f(tmp_path, pending, savedefconfig):
+    return Fixture(str(tmp_path), pending, savedefconfig)
 
 
 class TestBasic:
@@ -752,6 +760,24 @@ class TestSupersede:
         f.bot()
         prs = f.open_prs()
         assert [(p["head"], p["base"]) for p in prs] == [(f.branch("v1.0.2"), "main")]
+
+
+class TestSavedefconfig:
+    @pytest.fixture
+    def savedefconfig(self):
+        return True
+
+    def test_savedefconfig(self, f):
+        f.release("v1.0.1")
+        proc = f.bot()
+        # savedefconfig alone, it fills in the defaults like olddefconfig
+        assert "make savedefconfig..." in proc.stdout
+        assert "make olddefconfig..." not in proc.stdout
+        assert f.show(f.branch("v1.0.1"), DEFCONFIG) == "CONFIG_FOO=y\nCONFIG_TEST_SUBLEVEL=1"
+        assert "make savedefconfig" in f.message("v1.0.1").replace("\n", " ")
+        body = f.pr(1)["body"]
+        assert f"`make savedefconfig` changed `{DEFCONFIG}`:" in body
+        assert "+CONFIG_TEST_SUBLEVEL=1" in body
 
 
 class UmpfRepo:

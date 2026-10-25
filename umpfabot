@@ -1141,8 +1141,8 @@ class StableUpdate:
                 repo.umpf("format-patch", "--bb", "--update",
                           f"--patchdir={os.path.join(worktree, entry.patch_dir)}", utag)
                 if entry.defconfig:
-                    kconfig_diff = self.olddefconfig(repo, utag,
-                                                     os.path.join(worktree, entry.defconfig))
+                    kconfig_diff = self.update_defconfig(repo, utag,
+                                                         os.path.join(worktree, entry.defconfig))
                 if self.ctx.umpf_range_diff:
                     proc = repo.umpf("range-diff", series_file, utag, "--",
                                      "--no-color", "--no-patch", check=False)
@@ -1178,7 +1178,9 @@ class StableUpdate:
         staged.push_tags = repo.missing_remote_tags(tags)
         return staged
 
-    def olddefconfig(self, repo: UmpfRepo, utag: str, defconfig: str) -> str:
+    def update_defconfig(self, repo: UmpfRepo, utag: str, defconfig: str) -> str | None:
+        """the changes to the defconfig as diffconfig output, which is empty if only
+        comments changed, or None if it did not change"""
         entry = self.entry
         repo.git("checkout", "-q", "-f", "--detach", utag)
         repo.git("clean", "-q", "-f", "-d", "-x")
@@ -1188,20 +1190,19 @@ class StableUpdate:
             env = entry.sdk.env
         with tempfile.TemporaryDirectory(dir=self.ctx.work_dir) as build:
             shutil.copyfile(defconfig, os.path.join(build, ".config"))
-            targets = ["olddefconfig"] + (["savedefconfig"] if entry.savedefconfig else [])
-            for target in targets:
-                cmd = ["env", *[f"{k}={v}" for k, v in (env or {}).items()],
-                       "make", "-s", "-C", repo.path, f"O={build}", *entry.make_args, target]
-                if setup:
-                    cmd = ["bash", "-c", '. "$0" > /dev/null && exec "$@"', setup, *cmd]
-                info(f"{entry.id}: make {target}...")
-                run(cmd, env=os.environ.copy())
+            target = self.make_target()
+            cmd = ["env", *[f"{k}={v}" for k, v in (env or {}).items()],
+                   "make", "-s", "-C", repo.path, f"O={build}", *entry.make_args, target]
+            if setup:
+                cmd = ["bash", "-c", '. "$0" > /dev/null && exec "$@"', setup, *cmd]
+            info(f"{entry.id}: make {target}...")
+            run(cmd, env=os.environ.copy())
             result = os.path.join(build, "defconfig" if entry.savedefconfig else ".config")
             with open(defconfig) as f:
                 old = f.read()
             with open(result) as f:
                 new = f.read()
-            diff = ""
+            diff = None
             if old != new:
                 diffconfig = os.path.join(repo.path, "scripts", "diffconfig")
                 proc = None
@@ -1265,8 +1266,10 @@ class StableUpdate:
             text += "\nin\n" + "".join(f"  {f}\n" for f in c.files)
         return text.rstrip()
 
-    def make_targets(self) -> str:
-        return "olddefconfig" + (" savedefconfig" if self.entry.savedefconfig else "")
+    def make_target(self) -> str:
+        # savedefconfig fills in the defaults of new symbols just like
+        # olddefconfig, so running olddefconfig first changes nothing
+        return "savedefconfig" if self.entry.savedefconfig else "olddefconfig"
 
     def commit_message(self, staged: Staged) -> str:
         old = staged.old
@@ -1284,7 +1287,7 @@ class StableUpdate:
             text = f"Rebase the {old.name} umpf from {old.base} onto {staged.base}"
             if self.entry.defconfig:
                 text += (f" and update {os.path.basename(self.entry.defconfig)} with "
-                         f"make {self.make_targets()}")
+                         f"make {self.make_target()}")
             lines += [textwrap.fill(text + ".", 72)]
             lines += ["", f"Old umpf: {old.version}", f"New umpf: {staged.utag}"]
             url = self.compare_url(old.version, staged.utag)
@@ -1336,14 +1339,20 @@ class StableUpdate:
                         truncate(staged.range_diff.rstrip()), "```", "", "</details>", ""]
             if entry.defconfig:
                 out += ["### Kernel configuration", ""]
+                make = f"`make {self.make_target()}`"
                 if staged.kconfig_diff:
-                    out += [f"`make {self.make_targets()}` changed `{entry.defconfig}`:", "",
+                    out += [f"{make} changed `{entry.defconfig}`:", "",
                             "<details><summary>diffconfig</summary>", "", "```",
                             truncate(staged.kconfig_diff.rstrip()), "```", "",
                             "</details>", ""]
+                elif staged.kconfig_diff is not None:
+                    out += [f"{make} changed `{entry.defconfig}`, but no option: only "
+                            "comments, like the version in the header, or the order.", ""]
+                elif entry.savedefconfig:
+                    out += [f"{make} did not change `{entry.defconfig}`: {staged.base} "
+                            "changes none of its options, nor the defaults it relies on.", ""]
                 else:
-                    out += [f"`make {self.make_targets()}` did not change "
-                            f"`{entry.defconfig}`.", ""]
+                    out += [f"{make} did not change `{entry.defconfig}`.", ""]
             fetch, with_umpf, plain = self.review_commands(staged)
             out += ["### Reviewing", "", "To review the changes to the patch stack:", "",
                     "```sh", *fetch]
@@ -1393,7 +1402,7 @@ class StableUpdate:
                       "   ```sh", "   mkdir -p <build>",
                       f"   cp <bsp>/{entry.defconfig} <build>/.config",
                       f"   make {sdk_env + ' ' if sdk_env else ''}O=<build> "
-                      f"{self.make_targets()}",
+                      f"{self.make_target()}",
                       f"   cp <build>/{result} <bsp>/{entry.defconfig}", "   ```", ""]
         changed = " ".join(p for p in (entry.patch_dir, entry.defconfig) if p)
         lines += [f"{4 if entry.defconfig else 3}. Amend the commit of this pull request, "

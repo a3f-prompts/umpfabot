@@ -26,7 +26,8 @@ entry it:
      commits recorded in the BSP, so only the base changes,
    - ``umpf format-patch --bb --update`` into the BSP,
    - the ``SRC_URI`` sha256sum of the new base tarball in the recipe,
-   - ``make olddefconfig`` of the defconfig, in the configured SDK,
+   - ``make olddefconfig`` (or ``savedefconfig``) of the defconfig, in the
+     configured SDK,
    - a single commit with all of that,
 
 4. publishes, but only after everything was staged successfully: first the
@@ -47,7 +48,7 @@ umpf and the commands to review the changes to the patch stack::
   umpf range-diff 6.12/acme/20260901-1 6.12/acme/20261017-90
 
 The pull request additionally shows the ``umpf range-diff`` summary, the
-changes made by ``make olddefconfig`` and links to the upstream changelogs.
+changes to the defconfig and links to the upstream changelogs.
 If the umpf used by umpfabot has no ``range-diff`` command (see `umpf
 version`_), the summary is left out and only the equivalent ``git
 range-diff`` command is given.
@@ -124,25 +125,65 @@ Other changes are handled as follows:
 Setting it up
 =============
 
-1. Create a GitHub App with these repository permissions and install it for
-   the BSP and the umpf (kernel) repository:
+1. Create a GitHub App for umpfabot under the organization or user that owns
+   the repositories (*Settings* → *Developer settings* → *GitHub Apps* →
+   *New GitHub App*). The workflow only uses it to get a token, nothing runs
+   on a server of your own:
 
-   - *Contents*: read and write (BSP branches, umpf tags)
-   - *Pull requests*: read and write
+   - *GitHub App name*: must be unique on GitHub. The pull requests are
+     opened by ``<app-slug>[bot]``, and the logo of the App (*Display
+     information*) is their avatar.
+   - *Homepage URL*: e.g. the BSP repository.
+   - *Webhook*: uncheck *Active*, the App needs no events.
+   - *Repository permissions*:
+
+     - *Contents*: read and write (BSP branches, umpf tags)
+     - *Pull requests*: read and write
+     - *Workflows*: read and write, if the BSP or an umpf repository contains
+       GitHub workflows (``.github/workflows/``), like barebox does. GitHub
+       rejects pushes of an App without it if they add or change workflow
+       files, e.g. the umpf tag on a release that updated the workflows, or a
+       BSP branch recreated on a target branch with changed workflows.
+
+   - *Where can this GitHub App be installed?*: *Only on this account*.
+
+   On the *General* page of the App, note the *App ID* (not the *Client ID*)
+   and generate a private key, which is downloaded as a ``.pem`` file.
 
    The ``GITHUB_TOKEN`` of the workflow is not sufficient: it cannot push to
    the umpf repository, and pull requests created with it don't trigger
    workflows, so the CI of the BSP would not build them.
 
-2. Add the configuration as ``.github/umpfabot.yml`` to the BSP, see
-   `examples/umpfabot.yml <examples/umpfabot.yml>`_ and below.
+2. Install the App (*Install App*) for the BSP and the umpf repositories,
+   *Only select repositories* is enough.
 
-3. Add the workflow, see `examples/umpfabot-stable-update.yml
+3. Store the App ID as the variable ``UMPFABOT_APP_ID`` and the private key
+   (the whole ``.pem`` file) as the secret ``UMPFABOT_PRIVATE_KEY`` of the
+   BSP repository (*Settings* → *Secrets and variables* → *Actions*), which
+   the example workflow uses, e.g. with the GitHub CLI::
+
+     gh variable set UMPFABOT_APP_ID --body <app-id>
+     gh secret set UMPFABOT_PRIVATE_KEY < <app-slug>.<date>.private-key.pem
+
+4. Add the configuration as ``.github/umpfabot.yml`` to the BSP, see
+   `examples/umpfabot.yml <examples/umpfabot.yml>`_ and below. Set
+   ``author`` to the bot user of the App, so the commits show its logo as
+   well::
+
+     author: "<app-slug>[bot] <<user-id>+<app-slug>[bot]@users.noreply.github.com>"
+
+   The user ID is the ``id`` of the bot user, not the App ID::
+
+     curl -s 'https://api.github.com/users/<app-slug>%5Bbot%5D'
+
+   No separate user account is needed for this.
+
+5. Add the workflow, see `examples/umpfabot-stable-update.yml
    <examples/umpfabot-stable-update.yml>`_. It runs on a schedule and can be
    started manually from the *Actions* tab, optionally for one entry and a
-   specific release, or as a dry run.
+   specific release, or as a dry run. Start it as a dry run first.
 
-4. Make sure that
+6. Make sure that
 
    - rulesets and branch protection allow the app to push ``umpfabot/**``
      branches in the BSP and to create tags in the umpf repository,
@@ -159,8 +200,9 @@ Configuration
 .. code-block:: yaml
 
   version: 1
-  # identity for commits and tags (default: umpfabot <umpfabot@users.noreply.github.com>)
-  author: "Name <email>"
+  # identity for commits and tags, e.g. the bot user of the GitHub App, see
+  # "Setting it up" (default: umpfabot <umpfabot@users.noreply.github.com>)
+  author: "<app-slug>[bot] <<user-id>+<app-slug>[bot]@users.noreply.github.com>"
 
   umpf:
     repository: https://github.com/pengutronix/umpf.git
@@ -186,7 +228,7 @@ Configuration
 
       kconfig:
         defconfig: <path>           # required with kconfig
-        savedefconfig: false        # store the result of 'make savedefconfig'
+        savedefconfig: false        # minimal defconfig: make savedefconfig, not olddefconfig
         make-args: [LLVM=1]
 
       sdk:
@@ -217,9 +259,14 @@ assigned as ``SRC_URI[sha256sum]``, ``SRC_URI[<name>.sha256sum]`` or with an
 inline ``;sha256sum=`` in the recipe.
 
 ``make olddefconfig`` runs as ``make -C <kernel> O=<tmp> olddefconfig`` with
-a copy of the defconfig as ``.config``. ``sdk.env`` is applied after sourcing
-the SDK environment, so it can override variables set there. Without
-``sdk``, the tools of the runner are used.
+a copy of the defconfig as ``.config``, and the resulting ``.config``
+replaces the defconfig. With ``savedefconfig: true``, for a minimal
+defconfig, ``make savedefconfig`` runs instead and its ``defconfig``
+replaces the defconfig. It fills in the defaults of new options just like
+``olddefconfig``. A minimal defconfig has no header comment with the version,
+so it often stays the same in a stable update. ``sdk.env`` is applied after
+sourcing the SDK environment, so it can override variables set there.
+Without ``sdk``, the tools of the runner are used.
 
 umpf version
 ------------
