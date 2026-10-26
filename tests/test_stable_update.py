@@ -1199,6 +1199,7 @@ class FakeGitHub(http.server.ThreadingHTTPServer):
         self.f = fixture
         self.pulls = []
         self.comments = {}
+        self.releases = set()
         self.requests = []
         self.lock = threading.Lock()
         threading.Thread(target=self.serve_forever, daemon=True).start()
@@ -1235,7 +1236,8 @@ class FakeGitHubHandler(http.server.BaseHTTPRequestHandler):
         for k, v in headers:
             self.send_header(k, v)
         self.end_headers()
-        self.wfile.write(body)
+        if self.command != "HEAD":
+            self.wfile.write(body)
 
     def page(self, items, url, query):
         page = int(query.get("page", ["1"])[0])
@@ -1262,6 +1264,11 @@ class FakeGitHubHandler(http.server.BaseHTTPRequestHandler):
                 draft = "convertPullRequestToDraft" in data["query"]
                 gh.pulls[number - 1]["draft"] = draft
                 return self.reply(200, {"data": {}})
+            if parts[3:5] == ["releases", "tags"]:
+                tag = "/".join(parts[5:])
+                if tag in gh.releases:
+                    return self.reply(200, {"tag_name": tag})
+                return self.reply(404, {"message": "Not Found"})
             if parts[:3] != ["repos", "acme", "bsp"]:
                 return self.reply(404, {"message": "Not Found"})
             parts = parts[3:]
@@ -1301,6 +1308,9 @@ class FakeGitHubHandler(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self):
         self.handle_any("GET")
+
+    def do_HEAD(self):
+        self.handle_any("HEAD")
 
     def do_POST(self):
         self.handle_any("POST")
@@ -1347,6 +1357,29 @@ class TestGitHub:
         self.bot(f)
         assert len(gh.pulls) == 2
         assert len(gh.comments[1]) == 1
+
+    def test_github_release_notes(self, f, gh):
+        f.env["GITHUB_SERVER_URL"] = "https://github.test"
+        config = os.path.join(f.ci, ".github/umpfabot.yml")
+        with open(config) as c:
+            text = c.read().replace(
+                'changelog-url: "https://example.com/ChangeLog-{version}"',
+                'changelog-url: "https://github.test/up/linux/releases/tag/{tag}"\n'
+                '      changelog-fallback-url: '
+                '"https://github.test/up/linux/compare/{previous}...{tag}"')
+        with open(config, "w") as c:
+            c.write(text)
+        f.release("v1.0.1")
+        f.release("v1.0.2")
+        gh.releases.add("v1.0.2")
+        self.bot(f)
+        body = gh.pulls[0]["body"]
+        # v1.0.1 has no release notes, so the diff to the previous release
+        assert ("Upstream changes: [v1.0...v1.0.1]"
+                "(https://github.test/up/linux/compare/v1.0...v1.0.1), "
+                "[v1.0.2](https://github.test/up/linux/releases/tag/v1.0.2)\n") in body
+        assert ("HEAD", "/repos/up/linux/releases/tags/v1.0.1") in [
+            r[:2] for r in gh.requests]
 
     def test_github_ready_for_review(self, f, gh):
         f.release("v1.0.1", conflict=True)

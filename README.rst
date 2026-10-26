@@ -222,6 +222,7 @@ Configuration
         stable-version-parts: 2
         stable-release-regex: <regex on the version>
         changelog-url: <template>
+        changelog-fallback-url: <template>   # if there is no changelog
 
       tarball:
         url: <template>             # download to compute the SRC_URI sha256sum
@@ -258,10 +259,26 @@ Configuration
 
 The ``url`` and ``changelog-url`` templates can use ``{version}`` (e.g.
 ``6.12.53``), ``{tag}`` (``v6.12.53``), ``{major}`` (``6``), ``{minor}``
-(``12``), ``{series}`` (``6.12``) and ``{id}``. ``compare-url`` uses
-``{old}`` and ``{new}``, the old and new umpf tag. The checksum must be
-assigned as ``SRC_URI[sha256sum]``, ``SRC_URI[<name>.sha256sum]`` or with an
-inline ``;sha256sum=`` in the recipe.
+(``12``), ``{series}`` (``6.12``) and ``{id}``. The changelog templates can
+also use ``{previous}``, the tag of the release before (``v6.12.52``).
+``compare-url`` uses ``{old}`` and ``{new}``, the old and new umpf tag. The
+checksum must be assigned as ``SRC_URI[sha256sum]``,
+``SRC_URI[<name>.sha256sum]`` or with an inline ``;sha256sum=`` in the
+recipe.
+
+The pull request links the changelog of each release in the update. With
+``changelog-fallback-url``, umpfabot checks if the changelog exists, and links
+the fallback for releases without one instead. A GitHub release page exists
+for every tag, so for those, it checks if the tag has a release, i.e.
+release notes. For example, to link the release notes of barebox or, if
+there are none, the diff to the previous release:
+
+.. code-block:: yaml
+
+  upstream:
+    repository: https://github.com/barebox/barebox.git
+    changelog-url: "https://github.com/barebox/barebox/releases/tag/{tag}"
+    changelog-fallback-url: "https://github.com/barebox/barebox/compare/{previous}...{tag}"
 
 ``make olddefconfig`` runs as ``make O=<tmp> <make-args> olddefconfig`` in the
 kernel checkout, with a copy of the defconfig as ``.config``, and the

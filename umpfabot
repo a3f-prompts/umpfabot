@@ -150,9 +150,10 @@ def version_key(version: str) -> tuple:
                  for p in re.findall(r"\d+|[^\d.]+", version))
 
 
-def format_url(template: str, tag: str, version: str, entry_id: str) -> str:
+def format_url(template: str, tag: str, version: str, entry_id: str,
+               previous: str = "") -> str:
     parts = version.split(".")
-    return template.format(tag=tag, version=version, id=entry_id,
+    return template.format(tag=tag, version=version, id=entry_id, previous=previous,
                            major=parts[0], minor=parts[1] if len(parts) > 1 else "",
                            series=".".join(parts[:2]))
 
@@ -198,6 +199,7 @@ class Entry:
     stable_version_parts: int
     stable_release_regex: str | None
     changelog_url: str | None
+    changelog_fallback_url: str | None
     tarball_url: str | None
     checksum_name: str | None
     defconfig: str | None
@@ -284,6 +286,8 @@ def parse_entry(d: dict, index: int) -> Entry:
 
     if tarball and not d.get("recipe"):
         raise Error(f"{where}: 'tarball' requires 'recipe'")
+    if upstream.get("changelog-fallback-url") and not upstream.get("changelog-url"):
+        raise Error(f"{where}.upstream: 'changelog-fallback-url' requires 'changelog-url'")
     defconfig = _get(kconfig, "defconfig", str, where=f"{where}.kconfig")
     if kconfig and not defconfig:
         raise Error(f"{where}.kconfig: 'defconfig' is required")
@@ -301,6 +305,8 @@ def parse_entry(d: dict, index: int) -> Entry:
         stable_release_regex=_get(upstream, "stable-release-regex", str,
                                   where=f"{where}.upstream"),
         changelog_url=_get(upstream, "changelog-url", str, where=f"{where}.upstream"),
+        changelog_fallback_url=_get(upstream, "changelog-fallback-url", str,
+                                    where=f"{where}.upstream"),
         tarball_url=_get(tarball, "url", str, where=f"{where}.tarball"),
         checksum_name=_get(tarball, "checksum-name", str, where=f"{where}.tarball"),
         defconfig=defconfig,
@@ -960,8 +966,9 @@ class Context:
         os.makedirs(self.work_dir, exist_ok=True)
         self.token = (args.token or os.environ.get("UMPFABOT_TOKEN") or
                       os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN"))
-        server_url = os.environ.get("GITHUB_SERVER_URL", "https://github.com")
-        self.git_env = git_env(self.token, server_url)
+        self.server_url = os.environ.get("GITHUB_SERVER_URL", "https://github.com")
+        self.api_url = os.environ.get("GITHUB_API_URL", "https://api.github.com")
+        self.git_env = git_env(self.token, self.server_url)
         self.bsp = Git(self.bsp_dir, self.git_env)
         if not self.bsp.ok("rev-parse", "--git-dir"):
             raise Error(f"{self.bsp_dir} is not a git repository")
@@ -982,13 +989,12 @@ class Context:
             forge = LocalForge(args.forge_state, self.bsp_heads)
         else:
             repo = args.repo or os.environ.get("GITHUB_REPOSITORY") or self.repo_from_remote()
-            api_url = os.environ.get("GITHUB_API_URL", "https://api.github.com")
             graphql_url = os.environ.get("GITHUB_GRAPHQL_URL") or (
-                "https://api.github.com/graphql" if api_url == "https://api.github.com"
-                else re.sub(r"/v3/?$", "/graphql", api_url))
+                "https://api.github.com/graphql" if self.api_url == "https://api.github.com"
+                else re.sub(r"/v3/?$", "/graphql", self.api_url))
             if not self.token:
                 raise Error("no GitHub token: use --token or set UMPFABOT_TOKEN")
-            forge = GitHub(repo, self.token, api_url, graphql_url, self.dry_run)
+            forge = GitHub(repo, self.token, self.api_url, graphql_url, self.dry_run)
         self.forge = DryRunForge(forge) if self.dry_run else forge
         # BSP branches staged in this run (only differs from the remote in dry-run)
         self.tips: dict[str, str] = {}
@@ -1133,6 +1139,29 @@ class Context:
         with open(self.sha256_cache_file, "w") as f:
             json.dump(cache, f, indent=2)
         return cache[url]
+
+    def changelog_exists(self, url: str) -> bool:
+        """whether there is a changelog at url. A GitHub release page exists for
+        every tag, so for those, whether the tag has a release with release notes."""
+        headers = {"User-Agent": "umpfabot"}
+        m = re.fullmatch(re.escape(self.server_url.rstrip("/")) +
+                         r"/([^/]+/[^/]+)/releases/tag/([^/?#]+)", url)
+        if m:
+            url = f"{self.api_url.rstrip('/')}/repos/{m[1]}/releases/tags/{m[2]}"
+            headers["Accept"] = "application/vnd.github+json"
+            if self.token:
+                headers["Authorization"] = f"Bearer {self.token}"
+        try:
+            with urllib.request.urlopen(urllib.request.Request(url, headers=headers,
+                                                               method="HEAD")):
+                return True
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                return False
+            warning(f"cannot check {url}, linking the changelog anyway: {e}")
+        except urllib.error.URLError as e:
+            warning(f"cannot check {url}, linking the changelog anyway: {e}")
+        return True
 
     def sdk_environment_setup(self, sdk: Sdk) -> tuple[str, str] | None:
         """the root of the SDK, installed if needed, and its environment setup script"""
@@ -1437,14 +1466,26 @@ class StableUpdate:
         return template.format(old=old, new=new)
 
     def changelog_urls(self, old: str, new: str) -> list[str]:
-        if not self.entry.changelog_url:
+        """the changelog of each release after old up to new or, if it has none,
+        the fallback, e.g. the diff to the previous release"""
+        entry = self.entry
+        if not entry.changelog_url:
             return []
         try:
             tags = self.stable_tags(new)
         except Error:
             return []
-        return [format_url(self.entry.changelog_url, t, self.strip_prefix(t), self.entry.id)
-                for t in tags if self.newer(t, old) and not self.newer(t, new)]
+        urls = []
+        for previous, tag in zip([None] + tags, tags):
+            if not self.newer(tag, old) or self.newer(tag, new):
+                continue
+            args = (tag, self.strip_prefix(tag), entry.id, previous or "")
+            url = format_url(entry.changelog_url, *args)
+            if (entry.changelog_fallback_url and previous and
+                    not self.ctx.changelog_exists(url)):
+                url = format_url(entry.changelog_fallback_url, *args)
+            urls.append(url)
+        return urls
 
     def subject(self, base: str) -> str:
         return f"{self.entry.commit_prefix}update to {base}"
